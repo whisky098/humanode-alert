@@ -44,7 +44,7 @@ Create directory: `mkdir /srv/humanode/`
 
 Go to directory: `cd /srv/humanode/`
 
-Clone jar from git: `git clone --branch build https://github.com/gicu-adasanu/humanode-alert.git`
+Clone jar from git: `git clone --branch build https://github.com/whisky098/humanode-alert.git`
 
 Go to directory: `cd humanode-alert`
 
