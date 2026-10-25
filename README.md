@@ -42,18 +42,27 @@ starts the `humanode-alert` systemd service.
 
 ## 3. Register
 
-Open your bot in Telegram and send `/register`. From then on you receive the alerts in that chat. Messages from
-any other chat are ignored.
+At the end, the installer prints the command to send, with your registration code:
 
-To register from a different chat later, reset the registration:
+```
+/register 3f9c0a7d51e2b846
+```
+
+Open your bot in Telegram and send it. From then on you receive the alerts in that chat. Messages from any other
+chat are ignored. The code makes sure that only you can claim the bot, because bot usernames are public.
+
+The code is stored as `REGISTER_CODE` in the config. To see it again:
 
 ```bash
-sudo rm /var/lib/humanode-alert/state.json && sudo systemctl restart humanode-alert
+sudo grep REGISTER_CODE /etc/humanode-alert/config.env
 ```
+
+To move the alerts to a different chat, send the same command from there. The previous chat gets a message that
+the bot was registered elsewhere.
 
 ## Commands
 
-- `/register`: receive the alerts in this chat
+- `/register {code}`: receive the alerts in this chat
 - `/timezone {time_zone}`: timezone for the displayed times and the daily report, for example
   `/timezone Europe/Chisinau` or `/timezone UTC+3`. The default is UTC.
   [List of time zones](https://en.wikipedia.org/wiki/List_of_tz_database_time_zones)
@@ -116,7 +125,7 @@ The old version was a Java application started with `java -jar` inside `screen`,
    sudo ./install.sh
    ```
 
-4. In Telegram, send `/register` to the bot again, and `/timezone` if you had set one. The old `cache.json` is
+4. In Telegram, send the `/register` command printed by the installer, and `/timezone` if you had set one. The old `cache.json` is
    not imported, and the timezone is now UTC by default.
 
 5. Optionally, remove Java if nothing else on the server uses it: `sudo apt-get remove openjdk-17-jdk`.

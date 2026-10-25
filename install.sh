@@ -51,6 +51,17 @@ if [ ! -f "$CONFIG" ]; then
     echo "SERVICE_USER=$node_user" >> "$CONFIG"
 fi
 
+register_code="$(sed -n 's/^REGISTER_CODE=//p' "$CONFIG")"
+if [ -z "$register_code" ]; then
+    register_code="$("$PYTHON" -c 'import secrets; print(secrets.token_hex(8))')"
+    if grep -q '^REGISTER_CODE=' "$CONFIG"; then
+        set_value REGISTER_CODE "$register_code"
+    else  # config from a version without the code
+        echo "# Code to send with /register, so that only you can claim the bot" >> "$CONFIG"
+        echo "REGISTER_CODE=$register_code" >> "$CONFIG"
+    fi
+fi
+
 service_user="$(sed -n 's/^SERVICE_USER=//p' "$CONFIG")"
 
 install -d "$APP_DIR"
@@ -79,6 +90,10 @@ systemctl enable humanode-alert
 systemctl restart humanode-alert
 
 echo
-echo "Installed. Open your bot in Telegram and send /register, then /help for all commands."
+echo "Installed. Open your bot in Telegram and send:"
+echo
+echo "    /register $register_code"
+echo
+echo "Then send /help for all commands."
 echo "Settings: $CONFIG (then: systemctl restart humanode-alert)"
 echo "Logs:     journalctl -u humanode-alert -f"

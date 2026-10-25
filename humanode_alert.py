@@ -10,6 +10,7 @@ The chat id, timezone and notification switch are set from Telegram and kept in 
 import json
 import os
 import re
+import secrets
 import socket
 import subprocess
 import sys
@@ -52,6 +53,8 @@ if len(sys.argv) > 1 and not DETECT_RPC:
     load_env_file(CONFIG_FILE)
 
 TOKEN = setting("TELEGRAM_TOKEN", "" if DETECT_RPC else None)
+# bot usernames are public, so /register needs this code to claim the bot
+REGISTER_CODE = setting("REGISTER_CODE", "" if DETECT_RPC else None)
 RPC_URL = setting("RPC_URL", "http://127.0.0.1:9933")
 # tried at startup when RPC_URL does not respond; newer nodes serve HTTP RPC on 9944
 RPC_CANDIDATES = ["http://127.0.0.1:9944", "http://127.0.0.1:9933"]
@@ -66,13 +69,14 @@ DAILY_REPORT_HOUR = 12
 STATE_FILE = os.path.join(os.environ.get("STATE_DIRECTORY", "."), "state.json")
 
 SUCCESSFULLY_REGISTERED_MESSAGE = f"You have successfully registered, you will receive alerts every day (if have enabled notifications) with time left to authenticate and reminders {', '.join(map(str, sorted(WARN_MINUTES, reverse=True)))} minutes before expiry. To see commands for enable/disable notification type /help"
-UNKNOWN_COMMAND = "Unknown command, to register for receive alert about your node send command '/register', to set time zone id send command '/timezone time_zone_id'"
-MISSING_CHAT_ID = "Chat id not found, need to register, to register type '/register' in chat with bot"
+UNKNOWN_COMMAND = "Unknown command, to register for receive alert about your node send command '/register code', to set time zone id send command '/timezone time_zone_id'"
+MISSING_CHAT_ID = "Chat id not found, need to register, to register type '/register code' in chat with bot, the code is REGISTER_CODE in config.env"
+WRONG_REGISTER_CODE = "Wrong or missing code, send '/register code', the code is REGISTER_CODE in config.env"
 SUCCESSFULLY_REGISTERED_TIME_ZONE_ID = "You have successfully set time zone id"
 ENABLE_NOTIF = "Notifications have been enabled"
 DISABLED_NOTIF = "Notifications have been disabled"
 CANT_GET_URL = "Can't get url for authentication, check logs and HUMANODE_WORKSPACE in config.env"
-HELP = """/register -> register your node
+HELP = """/register code -> register your node in this chat, the code is REGISTER_CODE in config.env
 /timezone -> set timezone, example '/timezone Europe/Chisinau' or '/timezone UTC+3' (default UTC)
 /enable_notification -> enable notification about node every day at noon
 /disable_notification -> disable notification about node every day at noon
@@ -276,18 +280,24 @@ def handle_command(chat_id, text):
     command = command.split("@")[0]  # /help@my_bot in group chats
     arg = arg.strip()
 
-    if owner is not None and chat_id != owner:
-        if command == "/register":
-            send("This bot is already registered to another chat.", chat_id)
-        return  # ignore everyone except the owner
-
     if command == "/register":
+        if not secrets.compare_digest(arg.encode(), REGISTER_CODE.encode()):
+            send(WRONG_REGISTER_CODE, chat_id)
+            return
+        if owner is not None and owner != chat_id:
+            send("This bot has been registered to another chat, you will no longer receive alerts here.", owner)
         state["chat_id"] = chat_id
         save_state()
+        log(f"Registered chat {chat_id}")
         send(SUCCESSFULLY_REGISTERED_MESSAGE)
-    elif owner is None:
-        send(MISSING_CHAT_ID, chat_id)
-    elif command == "/timezone":
+        return
+
+    if chat_id != owner:
+        if owner is None:
+            send(MISSING_CHAT_ID, chat_id)
+        return  # ignore everyone except the owner
+
+    if command == "/timezone":
         try:
             parse_timezone(arg)
         except Exception:
