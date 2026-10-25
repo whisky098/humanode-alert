@@ -10,6 +10,7 @@ The chat id, timezone and notification switch are set from Telegram and kept in 
 import json
 import os
 import re
+import socket
 import subprocess
 import sys
 import threading
@@ -113,6 +114,31 @@ def parse_timezone(name):
 
 def tz():
     return parse_timezone(state.get("timezone", "UTC"))
+
+
+def connect_ipv4_first(address, timeout=None, source_address=None):
+    """socket.create_connection that tries IPv4 before IPv6. On some servers the IPv6 route
+    drops the first packet of a new connection, which delays every Telegram message by seconds."""
+    host, port = address
+    addresses = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    addresses.sort(key=lambda a: a[0] != socket.AF_INET)
+    error = OSError(f"no address for {host}")
+    for family, sock_type, proto, _, sockaddr in addresses:
+        sock = socket.socket(family, sock_type, proto)
+        try:
+            sock.settimeout(5)  # fall back to the next address quickly
+            if source_address:
+                sock.bind(source_address)
+            sock.connect(sockaddr)
+            sock.settimeout(timeout)
+            return sock
+        except OSError as e:
+            sock.close()
+            error = e
+    raise error
+
+
+socket.create_connection = connect_ipv4_first  # used by urllib for every request
 
 
 def post_json(url, payload, timeout=15):
@@ -282,7 +308,7 @@ def handle_command(chat_id, text):
         threading.Thread(target=lambda: send(new_auth_url()), daemon=True).start()
     elif command == "/status":
         threading.Thread(target=send_status, daemon=True).start()
-    elif command == "/help":
+    elif command in ("/help", "/start"):  # Telegram sends /start when the bot is first opened
         send(HELP)
     else:
         send(UNKNOWN_COMMAND)
