@@ -2,3 +2,4 @@ config.env
 state.json
 __pycache__/
 .idea/
+notes/
