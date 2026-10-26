@@ -99,7 +99,7 @@ HELP = """/register code -> register your node in this chat, the code is REGISTE
 /node_status -> whether the node process runs and if a node update is available
 /stop_node, /start_node, /restart_node -> control the node, asks for confirmation
 /update_node -> install a node update, asks for confirmation
-/menu, /help -> list of commands with buttons"""
+/menu, /help -> list of commands, pins the menu buttons under the message field"""
 # shown in the Telegram command menu next to the message field
 BOT_COMMANDS = [
     ("menu", "Buttons for the commands"),
@@ -650,14 +650,17 @@ MENU = [
     [("Update node", "/update_node")],
     [("Daily report on", "/enable_notification"), ("Daily report off", "/disable_notification")],
 ]
+MENU_COMMANDS = {label: command for row in MENU for label, command in row}
 
 
 def send_menu(text):
-    keyboard = [[{"text": label, "callback_data": f"cmd:{command}"} for label, command in row] for row in MENU]
+    """Pins the menu buttons under the message field. Pressing one sends its label, see MENU_COMMANDS."""
+    keyboard = [[{"text": label} for label, _ in row] for row in MENU]
     log(f"Sending menu: {text}")
     try:
         telegram("sendMessage", {"chat_id": state["chat_id"], "text": text,
-                                 "reply_markup": {"inline_keyboard": keyboard}})
+                                 "reply_markup": {"keyboard": keyboard, "is_persistent": True,
+                                                  "resize_keyboard": True}})
     except Exception as e:
         log(f"Failed to send message: {e}")
 
@@ -668,7 +671,7 @@ def handle_button(callback):
     answer = ""
     if chat_id != state.get("chat_id"):
         answer = "Not allowed"
-    elif kind == "cmd":  # menu button, same as typing the command
+    elif kind == "cmd":  # button of an older inline menu, same as typing the command
         handle_command(chat_id, value)
     else:  # yes/no confirmation
         operation = close_confirmation(value, "Confirmed" if kind == "yes" else "Cancelled")
@@ -785,6 +788,7 @@ def send_status():
 
 def handle_command(chat_id, text):
     owner = state.get("chat_id")
+    text = MENU_COMMANDS.get(text.strip(), text)  # a menu button sends its label
     command, _, arg = text.strip().partition(" ")
     command = command.split("@")[0]  # /help@my_bot in group chats
     arg = arg.strip()
@@ -798,7 +802,7 @@ def handle_command(chat_id, text):
         state["chat_id"] = chat_id
         save_state()
         log(f"Registered chat {chat_id}")
-        send(SUCCESSFULLY_REGISTERED_MESSAGE)
+        send_menu(SUCCESSFULLY_REGISTERED_MESSAGE)
         return
 
     if chat_id != owner:

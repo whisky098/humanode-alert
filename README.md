@@ -73,7 +73,8 @@ the bot was registered elsewhere.
 - `/node_status`: whether the node process runs and if a node update is available
 - `/stop_node`, `/start_node`, `/restart_node`: control the node, see [Node control](#node-control-experimental)
 - `/update_node`: install a node update, see [Node control](#node-control-experimental)
-- `/menu` or `/help`: list of commands, with buttons for the ones that need no text
+- `/menu` or `/help`: list of commands. It also pins menu buttons under the message field, for the commands that
+  need no text, and they stay there
 
 The commands are also listed in Telegram's menu button, next to the message field.
 
