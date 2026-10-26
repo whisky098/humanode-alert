@@ -1,7 +1,7 @@
 # Humanode alert
 
-A small Telegram bot that watches the BioAuth status of your Humanode node and sends you the authentication link
-when it expires.
+A small Telegram bot that watches the BioAuth status of your Humanode node, reminds you before it expires, and
+lets you control a Launcher node from Telegram.
 
 Each node owner installs and runs their own copy, on the same server and with the same Linux user as the node,
 because the node's RPC is only reachable locally.
@@ -15,6 +15,9 @@ What it does:
 - sends the time left until the next BioAuth every day at 12:00, if notifications are enabled
 - checks at startup that the node RPC responds. If `RPC_URL` is wrong, it tries `127.0.0.1:9944` and
   `127.0.0.1:9933` and tells you which one to put in the config
+- stops, starts, restarts and updates the node from Telegram, for nodes set up with the Humanode Launcher
+  (experimental, see [Node control](#node-control-experimental))
+- keeps a button menu pinned under the message field
 
 The authentication link is generated only when you send `/get_bioauth_link`, never automatically. Requesting
 links too often makes the node hang. The command runs `humanode-websocket-tunnel` (reused if it is already
@@ -48,8 +51,9 @@ At the end, the installer prints the command to send, with your registration cod
 /register 3f9c0a7d51e2b846
 ```
 
-Open your bot in Telegram and send it. From then on you receive the alerts in that chat. Messages from any other
-chat are ignored. The code makes sure that only you can claim the bot, because bot usernames are public.
+Open your bot in Telegram and send it. From then on you receive the alerts in that chat, and the menu buttons
+appear under the message field. Messages from any other chat are ignored. The code makes sure that only you can
+claim the bot, because bot usernames are public.
 
 The code is stored as `REGISTER_CODE` in the config. To see it again:
 
@@ -90,6 +94,11 @@ asks it to do the same thing the Launcher buttons do.
   and starts the node again, even if the update failed.
 - Every day at 12:00 the bot tells you if a new node version is available. It never installs it by itself.
 - Close the Launcher before using these commands. The bot refuses them while the Launcher is connected.
+- After stopping, the bot waits until `humanode-peer` has exited. If the engine left it running, for example
+  because the Launcher started it, the bot asks the node to shut down gracefully (SIGTERM, like Ctrl+C). It never
+  starts a second node while one is running.
+- When the bot runs as root, the engine runs in its own systemd scope, so a node started from Telegram keeps
+  running when the bot restarts or is updated. With another user this is not guaranteed yet.
 - No "Humanode is down" alerts are sent after `/stop_node`, until the node is started again.
 
 To check that the bot can talk to the engine, without changing anything:
@@ -109,6 +118,9 @@ sudo systemctl restart humanode-alert
 
 The chat id, timezone and notification setting come from the Telegram commands and are kept in
 `/var/lib/humanode-alert/state.json`.
+
+The node commands find the Launcher's engine next to the workspaces folder, for example
+`/root/.humanode/humanode-engine`. If yours is somewhere else, set `HUMANODE_ENGINE` in the config.
 
 ## Logs, update, uninstall
 
@@ -151,8 +163,8 @@ The old version was a Java application started with `java -jar` inside `screen`,
    sudo ./install.sh
    ```
 
-4. In Telegram, send the `/register` command printed by the installer, and `/timezone` if you had set one. The old `cache.json` is
-   not imported, and the timezone is now UTC by default.
+4. In Telegram, send the `/register` command printed by the installer, and `/timezone` if you had set one.
+   The old `cache.json` is not imported, and the timezone is now UTC by default.
 
 5. Optionally, remove Java if nothing else on the server uses it: `sudo apt-get remove openjdk-17-jdk`.
 
