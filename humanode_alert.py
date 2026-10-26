@@ -98,7 +98,23 @@ HELP = """/register code -> register your node in this chat, the code is REGISTE
 /node_status -> whether the node process runs and if a node update is available
 /stop_node, /start_node, /restart_node -> control the node, asks for confirmation
 /update_node -> install a node update, asks for confirmation
-/help -> list of commands"""
+/menu, /help -> list of commands with buttons"""
+# shown in the Telegram command menu next to the message field
+BOT_COMMANDS = [
+    ("menu", "Buttons for the commands"),
+    ("status", "Time left until the next BioAuth"),
+    ("get_bioauth_link", "Get a new authentication link"),
+    ("node_status", "Node process and available updates"),
+    ("restart_node", "Restart the node"),
+    ("stop_node", "Stop the node"),
+    ("start_node", "Start the node"),
+    ("update_node", "Install a node update"),
+    ("timezone", "Set the timezone, e.g. /timezone Europe/Chisinau"),
+    ("enable_notification", "Enable the daily report at noon"),
+    ("disable_notification", "Disable the daily report at noon"),
+    ("register", "Register this chat: /register code"),
+    ("help", "List of commands"),
+]
 
 
 def load_state():
@@ -537,7 +553,8 @@ def report_node_started():
 def run_node_operation(operation):
     """Runs operation(engine) in the background, one at a time, and reports errors in Telegram."""
     def run():
-        if not node_lock.acquire(blocking=False):
+        # a short wait covers a confirmation pressed while the previous engine is still closing
+        if not node_lock.acquire(timeout=20):
             send("Another node operation is running, try again later")
             return
         try:
@@ -552,6 +569,75 @@ def run_node_operation(operation):
             node_lock.release()
 
     threading.Thread(target=run, daemon=True).start()
+
+
+CONFIRM_SECONDS = 10
+confirmations = {}  # token: (operation, message_id, question) waiting for a Yes/No button
+
+
+def ask_confirmation(question, operation):
+    """Sends Yes/No buttons. The operation runs only if Yes is pressed within CONFIRM_SECONDS."""
+    token = secrets.token_hex(4)
+    buttons = [[{"text": "Yes", "callback_data": f"yes:{token}"}, {"text": "No", "callback_data": f"no:{token}"}]]
+    try:
+        message = telegram("sendMessage", {"chat_id": state["chat_id"], "reply_markup": {"inline_keyboard": buttons},
+                                           "text": f"{question}\nConfirm within {CONFIRM_SECONDS} seconds."})
+    except Exception as e:
+        log(f"Failed to send message: {e}")
+        return
+    confirmations[token] = (operation, message["message_id"], question)
+    timer = threading.Timer(CONFIRM_SECONDS, close_confirmation, args=(token, "Expired, nothing was done"))
+    timer.daemon = True
+    timer.start()
+
+
+def close_confirmation(token, outcome):
+    """Replaces the buttons with the outcome. Returns the operation if it was still waiting."""
+    pending = confirmations.pop(token, None)  # the button and the timer race, only one gets it
+    if pending is None:
+        return None
+    operation, message_id, question = pending
+    try:
+        telegram("editMessageText", {"chat_id": state["chat_id"], "message_id": message_id,
+                                     "text": f"{question}\n{outcome}"})
+    except Exception as e:
+        log(f"Failed to edit message: {e}")
+    return operation
+
+
+MENU = [
+    [("Status", "/status"), ("Node status", "/node_status")],
+    [("BioAuth link", "/get_bioauth_link")],
+    [("Restart node", "/restart_node"), ("Stop node", "/stop_node"), ("Start node", "/start_node")],
+    [("Update node", "/update_node")],
+    [("Daily report on", "/enable_notification"), ("Daily report off", "/disable_notification")],
+]
+
+
+def send_menu(text):
+    keyboard = [[{"text": label, "callback_data": f"cmd:{command}"} for label, command in row] for row in MENU]
+    log(f"Sending menu: {text}")
+    try:
+        telegram("sendMessage", {"chat_id": state["chat_id"], "text": text,
+                                 "reply_markup": {"inline_keyboard": keyboard}})
+    except Exception as e:
+        log(f"Failed to send message: {e}")
+
+
+def handle_button(callback):
+    kind, _, value = (callback.get("data") or "").partition(":")
+    chat_id = (callback.get("message") or {}).get("chat", {}).get("id")
+    answer = ""
+    if chat_id != state.get("chat_id"):
+        answer = "Not allowed"
+    elif kind == "cmd":  # menu button, same as typing the command
+        handle_command(chat_id, value)
+    else:  # yes/no confirmation
+        operation = close_confirmation(value, "Confirmed" if kind == "yes" else "Cancelled")
+        answer = ("Confirmed" if kind == "yes" else "Cancelled") if operation else "Expired"
+        if operation and kind == "yes":
+            run_node_operation(operation)
+    telegram("answerCallbackQuery", {"callback_query_id": callback["id"], "text": answer})
 
 
 NODE_COMMANDS = {
@@ -576,8 +662,8 @@ def update_node(confirmed):
             send("No node updates available")
             return False
         if not confirmed:
-            send("A node update is available. Updating stops the node, installs the update and starts the node "
-                 "again. To continue, send '/update_node confirm'")
+            ask_confirmation("A node update is available. Updating stops the node, installs the update and "
+                             "starts the node again. Continue?", update_node(True))
             return False
         install_update(engine)
         return True
@@ -708,13 +794,13 @@ def handle_command(chat_id, text):
         if arg == "confirm":
             run_node_operation(operation)
         else:
-            send(f"This will {description}. To continue, send '{command} confirm'")
+            ask_confirmation(f"This will {description}. Continue?", operation)
     elif command == "/update_node":
         run_node_operation(update_node(arg == "confirm"))
     elif command == "/node_status":
         run_node_operation(node_status)
-    elif command in ("/help", "/start"):  # Telegram sends /start when the bot is first opened
-        send(HELP)
+    elif command in ("/help", "/start", "/menu"):  # Telegram sends /start when the bot is first opened
+        send_menu(HELP)
     else:
         send(UNKNOWN_COMMAND)
 
@@ -734,6 +820,12 @@ def poll_commands():
 
         for update in updates:
             offset = update["update_id"] + 1
+            if "callback_query" in update:  # a Yes/No button was pressed
+                try:
+                    handle_button(update["callback_query"])
+                except Exception as e:
+                    log(f"Button failed: {e}")
+                continue
             message = update.get("message") or {}
             if "text" in message:
                 try:
@@ -759,6 +851,10 @@ def main():
     if state.get("chat_id") is None:
         log(MISSING_CHAT_ID)
     check_rpc_url()
+    try:
+        telegram("setMyCommands", {"commands": [{"command": c, "description": d} for c, d in BOT_COMMANDS]})
+    except Exception as e:
+        log(f"Failed to set the command menu: {e}")
     threading.Thread(target=poll_commands, daemon=True).start()
 
     monitor = Monitor()

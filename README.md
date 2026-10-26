@@ -73,7 +73,9 @@ the bot was registered elsewhere.
 - `/node_status`: whether the node process runs and if a node update is available
 - `/stop_node`, `/start_node`, `/restart_node`: control the node, see [Node control](#node-control-experimental)
 - `/update_node`: install a node update, see [Node control](#node-control-experimental)
-- `/help`: list of commands
+- `/menu` or `/help`: list of commands, with buttons for the ones that need no text
+
+The commands are also listed in Telegram's menu button, next to the message field.
 
 ## Node control (experimental)
 
@@ -81,9 +83,10 @@ For nodes set up with the Humanode Launcher, the bot can stop, start, restart an
 need to open the Launcher. It starts the Launcher's own engine (`~/.humanode/humanode-engine`) on the server and
 asks it to do the same thing the Launcher buttons do.
 
-- Every command asks for confirmation: send it again with `confirm`, for example `/restart_node confirm`.
-- `/update_node` checks for a new node version first. With `confirm`, it stops the node, installs the update and
-  starts the node again, even if the update failed.
+- Every command asks for confirmation with Yes and No buttons, active for 10 seconds. To skip the buttons, add
+  `confirm`, for example `/restart_node confirm`.
+- `/update_node` checks for a new node version first. When you confirm, it stops the node, installs the update
+  and starts the node again, even if the update failed.
 - Every day at 12:00 the bot tells you if a new node version is available. It never installs it by itself.
 - Close the Launcher before using these commands. The bot refuses them while the Launcher is connected.
 - No "Humanode is down" alerts are sent after `/stop_node`, until the node is started again.
