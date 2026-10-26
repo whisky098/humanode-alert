@@ -70,7 +70,29 @@ the bot was registered elsewhere.
 - `/disable_notification`: disable the daily report at 12:00
 - `/get_bioauth_link`: get a new authentication link
 - `/status`: time left until the next BioAuth
+- `/node_status`: whether the node process runs and if a node update is available
+- `/stop_node`, `/start_node`, `/restart_node`: control the node, see [Node control](#node-control-experimental)
+- `/update_node`: install a node update, see [Node control](#node-control-experimental)
 - `/help`: list of commands
+
+## Node control (experimental)
+
+For nodes set up with the Humanode Launcher, the bot can stop, start, restart and update the node, so you don't
+need to open the Launcher. It starts the Launcher's own engine (`~/.humanode/humanode-engine`) on the server and
+asks it to do the same thing the Launcher buttons do.
+
+- Every command asks for confirmation: send it again with `confirm`, for example `/restart_node confirm`.
+- `/update_node` checks for a new node version first. With `confirm`, it stops the node, installs the update and
+  starts the node again, even if the update failed.
+- Every day at 12:00 the bot tells you if a new node version is available. It never installs it by itself.
+- Close the Launcher before using these commands. The bot refuses them while the Launcher is connected.
+- No "Humanode is down" alerts are sent after `/stop_node`, until the node is started again.
+
+To check that the bot can talk to the engine, without changing anything:
+
+```bash
+sudo python3 /opt/humanode-alert/humanode_alert.py /etc/humanode-alert/config.env --engine-probe
+```
 
 ## Configuration
 

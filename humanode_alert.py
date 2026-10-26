@@ -5,13 +5,21 @@ Settings come from environment variables (see config.env.example). To run it by 
     python3 humanode_alert.py /etc/humanode-alert/config.env
 
 The chat id, timezone and notification switch are set from Telegram and kept in state.json.
+
+To check the node controls without changing anything (run as the node user):
+    python3 humanode_alert.py /etc/humanode-alert/config.env --engine-probe
 """
 
+import base64
+import itertools
 import json
 import os
+import queue
 import re
 import secrets
+import shutil
 import socket
+import struct
 import subprocess
 import sys
 import threading
@@ -47,14 +55,17 @@ def setting(name, default=None):
     return default
 
 
-DETECT_RPC = sys.argv[1:] == ["--detect-rpc"]  # used by install.sh
-CONFIG_FILE = sys.argv[1] if len(sys.argv) > 1 and not DETECT_RPC else "/etc/humanode-alert/config.env"
-if len(sys.argv) > 1 and not DETECT_RPC:
+FLAGS = {arg for arg in sys.argv[1:] if arg.startswith("--")}
+DETECT_RPC = "--detect-rpc" in FLAGS  # used by install.sh
+ENGINE_PROBE = "--engine-probe" in FLAGS
+CONFIG_ARGS = [arg for arg in sys.argv[1:] if not arg.startswith("--")]
+CONFIG_FILE = CONFIG_ARGS[0] if CONFIG_ARGS else "/etc/humanode-alert/config.env"
+if CONFIG_ARGS:
     load_env_file(CONFIG_FILE)
 
-TOKEN = setting("TELEGRAM_TOKEN", "" if DETECT_RPC else None)
+TOKEN = setting("TELEGRAM_TOKEN", "" if FLAGS else None)
 # bot usernames are public, so /register needs this code to claim the bot
-REGISTER_CODE = setting("REGISTER_CODE", "" if DETECT_RPC else None)
+REGISTER_CODE = setting("REGISTER_CODE", "" if FLAGS else None)
 RPC_URL = setting("RPC_URL", "http://127.0.0.1:9933")
 # tried at startup when RPC_URL does not respond; newer nodes serve HTTP RPC on 9944
 RPC_CANDIDATES = ["http://127.0.0.1:9944", "http://127.0.0.1:9933"]
@@ -62,6 +73,8 @@ WORKSPACE = setting("HUMANODE_WORKSPACE", "/root/.humanode/workspaces/default")
 AUTH_URL_CMD = [f"{WORKSPACE}/humanode-peer", "bioauth", "auth-url", "--rpc-url-ngrok-detect",
                 "--chain", f"{WORKSPACE}/chainspec.json"]
 TUNNEL_CMD = [f"{WORKSPACE}/humanode-websocket-tunnel"]
+# the Humanode Launcher installs its engine in ~/.humanode, next to the workspaces folder
+ENGINE = setting("HUMANODE_ENGINE", os.path.join(os.path.dirname(os.path.dirname(WORKSPACE)), "humanode-engine"))
 WARN_MINUTES = {int(m) for m in setting("WARN_MINUTES", "60,30,5,3,1").split(",") if m.strip()}
 ALERT_REPEAT_MINUTES = int(setting("ALERT_REPEAT_MINUTES", "5"))
 DAILY_REPORT_HOUR = 12
@@ -82,6 +95,9 @@ HELP = """/register code -> register your node in this chat, the code is REGISTE
 /disable_notification -> disable notification about node every day at noon
 /get_bioauth_link -> get new auth link
 /status -> time left until the next BioAuth
+/node_status -> whether the node process runs and if a node update is available
+/stop_node, /start_node, /restart_node -> control the node, asks for confirmation
+/update_node -> install a node update, asks for confirmation
 /help -> list of commands"""
 
 
@@ -232,6 +248,372 @@ def bioauth_information(expires_at):
     send(f"Next BioAuth on {expires_at:%Y-%m-%d %H:%M:%S}, remaining {days}d and {hours}h:{minutes}m:{seconds}s")
 
 
+class WebSocket:
+    """Minimal WebSocket client for text messages, enough to talk to the Launcher engine."""
+
+    def __init__(self, host, port, timeout=15):
+        self.sock = socket.create_connection((host, port), timeout=timeout)
+        key = base64.b64encode(os.urandom(16)).decode()
+        self.sock.sendall((f"GET / HTTP/1.1\r\nHost: {host}:{port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+                           f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n").encode())
+        self.buffer = b""
+        while b"\r\n\r\n" not in self.buffer:
+            self.buffer += self._recv_some()
+        header, self.buffer = self.buffer.split(b"\r\n\r\n", 1)
+        if b" 101 " not in header.split(b"\r\n")[0]:
+            raise ConnectionError(f"WebSocket handshake failed: {header.splitlines()[0].decode(errors='replace')}")
+
+    def _recv_some(self):
+        chunk = self.sock.recv(65536)
+        if not chunk:
+            raise ConnectionError("the engine closed the connection")
+        return chunk
+
+    def _read(self, size):
+        while len(self.buffer) < size:
+            self.buffer += self._recv_some()
+        data, self.buffer = self.buffer[:size], self.buffer[size:]
+        return data
+
+    def _send_frame(self, opcode, payload):
+        size = len(payload)
+        if size < 126:
+            header = struct.pack("!BB", 0x80 | opcode, 0x80 | size)
+        elif size < 65536:
+            header = struct.pack("!BBH", 0x80 | opcode, 0x80 | 126, size)
+        else:
+            header = struct.pack("!BBQ", 0x80 | opcode, 0x80 | 127, size)
+        mask = os.urandom(4)  # clients must mask every frame
+        self.sock.sendall(header + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(payload)))
+
+    def send(self, text):
+        self._send_frame(0x1, text.encode())
+
+    def recv(self, timeout):
+        """Returns the next text message, answering pings and joining fragmented frames."""
+        self.sock.settimeout(timeout)
+        message = b""
+        while True:
+            first, second = self._read(2)
+            size = second & 0x7F
+            if size == 126:
+                size = struct.unpack("!H", self._read(2))[0]
+            elif size == 127:
+                size = struct.unpack("!Q", self._read(8))[0]
+            mask = self._read(4) if second & 0x80 else None
+            payload = self._read(size)
+            if mask:
+                payload = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+            opcode = first & 0x0F
+            if opcode == 0x8:
+                raise ConnectionError("the engine closed the connection")
+            if opcode == 0x9:
+                self._send_frame(0xA, payload)
+            elif opcode in (0x0, 0x1):
+                message += payload
+                if first & 0x80:
+                    return message.decode()
+
+    def close(self):
+        try:
+            self._send_frame(0x8, b"")
+        except OSError:
+            pass
+        self.sock.close()
+
+
+class EngineError(Exception):
+    pass
+
+
+# pids of engines started by the bot, so they are not mistaken for the Launcher's engine
+bot_engines = set()
+
+
+def launcher_engine_running():
+    """True when an engine started by the Humanode Launcher runs, i.e. the Launcher is connected."""
+    if not os.path.isdir("/proc"):
+        return False
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit() or int(pid) in bot_engines:
+            continue
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                cmdline = f.read()
+        except OSError:
+            continue
+        if b"humanode-engine" in cmdline and b"--workspacePath" in cmdline:
+            return True
+    return False
+
+
+class Engine:
+    """Starts the Humanode Launcher engine on this server and calls its functions over WebSocket,
+    the same way the Launcher UI does through its SSH tunnel. The engine has no public API: the
+    protocol was taken from the Launcher's code. The engine exits by itself after we disconnect."""
+
+    def __init__(self):
+        if launcher_engine_running():
+            raise EngineError("the Humanode Launcher is connected to the node, close it and try again")
+        if not os.path.exists(ENGINE):
+            raise EngineError(f"the engine was not found at {ENGINE}, set HUMANODE_ENGINE in {CONFIG_FILE}")
+        command = [ENGINE, "--port", "0", "--workspacePath", WORKSPACE, "--idleTimeoutMs", "3000",
+                   "--host", "127.0.0.1"]
+        if os.geteuid() == 0 and shutil.which("systemd-run"):
+            # a scope of its own, so the node started by the engine keeps running when the bot restarts
+            command = ["systemd-run", "--scope", "--quiet", "--collect",
+                       f"--unit=humanode-engine-{time.time_ns()}"] + command
+        log(f"Starting the engine: {' '.join(command)}")
+        self.process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                                        cwd=os.path.dirname(os.path.dirname(ENGINE)))
+        bot_engines.add(self.process.pid)
+        self.ids = itertools.count()
+        self.callbacks = {}
+        self.responses = {}
+        ports = queue.Queue()
+        threading.Thread(target=self._read_output, args=(ports,), daemon=True).start()
+        try:
+            port = ports.get(timeout=15)
+            if port is None:
+                raise EngineError(f"the engine exited with code {self.process.wait()}, check the logs")
+            self.ws = WebSocket("127.0.0.1", port)
+        except Exception as e:
+            self.process.kill()
+            if isinstance(e, queue.Empty):
+                raise EngineError("the engine did not start in 15 seconds, check the logs")
+            raise
+
+    def _read_output(self, ports):
+        # always drain the output, a full pipe would block the engine
+        for line in self.process.stdout:
+            log(f"engine: {line.rstrip()}")
+            match = re.search(r"Listening on port (\d+)", line)
+            if match:
+                ports.put(int(match.group(1)))
+        ports.put(None)
+
+    def _serialize(self, value):
+        if callable(value):
+            callback_id = f"callback-{next(self.ids)}"
+            self.callbacks[callback_id] = value
+            return {"kind": "function", "data": callback_id}
+        if isinstance(value, dict):
+            return {"kind": "object", "data": {k: self._serialize(v) for k, v in value.items()}}
+        if isinstance(value, (list, tuple)):
+            return {"kind": "array", "data": [self._serialize(v) for v in value]}
+        return {"kind": "raw", "data": value}
+
+    def _deserialize(self, value):
+        kind, data = value.get("kind"), value.get("data")
+        if kind == "array":
+            return [self._deserialize(v) for v in data]
+        if kind == "object":
+            return {k: self._deserialize(v) for k, v in data.items()}
+        if kind == "function":
+            return None  # unsubscribe handles of watch functions, not needed
+        return data
+
+    def pump(self, done, timeout):
+        """Handles engine messages, running our callbacks, until done() is true."""
+        deadline = time.monotonic() + timeout
+        while not done():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise EngineError("timed out waiting for the engine")
+            try:
+                message = json.loads(self.ws.recv(timeout=remaining))
+            except socket.timeout:
+                raise EngineError("timed out waiting for the engine")
+            kind = message.get("kind")
+            if kind == "request":  # the engine calls one of our callbacks
+                callback = self.callbacks.get(message.get("functionId"))
+                if callback:
+                    callback(*[self._deserialize(arg) for arg in message.get("data", [])])
+                self.ws.send(json.dumps({"kind": "response", "requestId": message.get("requestId"),
+                                         "data": {"kind": "raw", "data": None}}))
+            elif kind == "response":
+                self.responses[message.get("requestId")] = (True, self._deserialize(message.get("data") or {}))
+            elif kind == "error":
+                self.responses[message.get("requestId")] = (False, message.get("error"))
+
+    def call(self, function, *args, timeout=120):
+        request_id = str(next(self.ids))
+        log(f"Engine call: {function}")
+        self.ws.send(json.dumps({"kind": "request", "functionId": function, "requestId": request_id,
+                                 "data": [self._serialize(arg) for arg in args]}))
+        self.pump(lambda: request_id in self.responses, timeout)
+        ok, value = self.responses.pop(request_id)
+        if not ok:
+            raise EngineError(f"{function} failed: {value}")
+        return value
+
+    def close(self):
+        self.ws.close()
+        try:
+            self.process.wait(timeout=15)
+            bot_engines.discard(self.process.pid)
+        except subprocess.TimeoutExpired:
+            log("The engine is still running after the disconnect")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+
+node_lock = threading.Lock()  # one node operation at a time
+node_stopped_on_purpose = False  # no "Humanode is down" alerts after /stop_node
+
+
+def node_is_running(engine):
+    status = {}
+    engine.call("watchIsNodeRunning", {"onStatus": lambda s: status.setdefault("running", bool((s or {}).get("isRunning")))})
+    engine.pump(lambda: "running" in status, timeout=30)
+    return status["running"]
+
+
+def update_available(engine):
+    return bool(engine.call("checkForBinariesUpdates").get("updateAvailable"))
+
+
+def stop_node(engine):
+    global node_stopped_on_purpose
+    send("Stopping the node...")
+    node_stopped_on_purpose = True
+    engine.call("stopWorkspace", timeout=300)
+    send("Node stopped")
+
+
+def start_node(engine):
+    global node_stopped_on_purpose
+    node_stopped_on_purpose = False
+    cfg = engine.call("readWorkspaceConfig").get("cfg") or {}
+    if cfg.get("isValidator") and not cfg.get("mnemonicInserted"):  # the Launcher refuses to start too
+        raise EngineError("the mnemonic is not inserted, insert it from the Launcher settings first")
+    send("Starting the node...")
+    engine.call("startWorkspace", timeout=300)
+
+
+def install_update(engine):
+    result, reported = {}, set()
+
+    def on_progress(event):
+        progress = float((event or {}).get("progress") or 0)
+        percent = int(progress * 100 if progress <= 1 else progress) // 25 * 25
+        if 0 < percent < 100 and percent not in reported:
+            reported.add(percent)
+            send(f"Update {percent}%")
+
+    stop_node(engine)
+    send("Installing the update...")
+    try:
+        engine.call("updateWorkspace", {"onProgress": on_progress,
+                                        "onFinish": lambda *args: result.setdefault("finished", True),
+                                        "onError": lambda *args: result.setdefault("error", args[0] if args else None)},
+                    timeout=1800)
+        engine.pump(lambda: result, timeout=1800)
+    finally:
+        start_node(engine)  # never leave the node stopped, even when the update failed
+    if "error" in result:
+        raise EngineError(f"the update failed: {result['error']}")
+    send("Update installed")
+
+
+def report_node_started():
+    send("Node started, waiting for its RPC to respond...")
+    deadline = time.monotonic() + 300
+    while time.monotonic() < deadline:
+        try:
+            if "result" in bioauth_rpc(RPC_URL, timeout=5):
+                send_status()
+                return
+        except Exception:
+            pass
+        time.sleep(5)
+    send("The node was started, but its RPC does not respond after 5 minutes. Check it later with /status")
+
+
+def run_node_operation(operation):
+    """Runs operation(engine) in the background, one at a time, and reports errors in Telegram."""
+    def run():
+        if not node_lock.acquire(blocking=False):
+            send("Another node operation is running, try again later")
+            return
+        try:
+            with Engine() as engine:
+                started = operation(engine)
+            if started:
+                report_node_started()
+        except Exception as e:
+            log(f"Node operation failed: {e!r}")
+            send(f"Node operation failed: {e}")
+        finally:
+            node_lock.release()
+
+    threading.Thread(target=run, daemon=True).start()
+
+
+NODE_COMMANDS = {
+    # command: (what it does, operation returning True when it started the node)
+    "/stop_node": ("stop your node. It stops validating until you send /start_node",
+                   lambda engine: stop_node(engine)),
+    "/start_node": ("start your node", lambda engine: start_node(engine) or True),
+    "/restart_node": ("restart your node", lambda engine: stop_node(engine) or start_node(engine) or True),
+}
+
+
+def node_status(engine):
+    running = node_is_running(engine)
+    update = update_available(engine)
+    send(f"Node process: {'running' if running else 'stopped'}\n"
+         f"Node update available: {'yes, send /update_node' if update else 'no'}")
+
+
+def update_node(confirmed):
+    def operation(engine):
+        if not update_available(engine):
+            send("No node updates available")
+            return False
+        if not confirmed:
+            send("A node update is available. Updating stops the node, installs the update and starts the node "
+                 "again. To continue, send '/update_node confirm'")
+            return False
+        install_update(engine)
+        return True
+    return operation
+
+
+def notify_if_update_available():
+    """Daily check, only notifies: updates are installed with /update_node."""
+    if not os.path.exists(ENGINE) or not node_lock.acquire(blocking=False):
+        return
+    try:
+        with Engine() as engine:
+            if update_available(engine):
+                send("A new node version is available. Send /update_node to install it")
+    except Exception as e:
+        log(f"Update check failed: {e!r}")
+    finally:
+        node_lock.release()
+
+
+def engine_probe():
+    """Read-only check that the bot can talk to the Launcher engine on this server."""
+    print(f"Engine: {ENGINE} (exists: {os.path.exists(ENGINE)})")
+    print(f"Workspace: {WORKSPACE}")
+    print(f"Launcher engine running: {launcher_engine_running()}")
+    print(f"Own systemd scope: {os.geteuid() == 0 and bool(shutil.which('systemd-run'))}")
+    with Engine() as engine:
+        print("isWorkspaceInitialized:", engine.call("isWorkspaceInitialized"))
+        cfg = engine.call("readWorkspaceConfig").get("cfg") or {}
+        print("config keys:", sorted(cfg))
+        print("isValidator:", cfg.get("isValidator"), " mnemonicInserted:", cfg.get("mnemonicInserted"))
+        print("node running:", node_is_running(engine))
+        print("checkForBinariesUpdates:", engine.call("checkForBinariesUpdates"))
+    print("engine still running after disconnect:", engine.process.poll() is None)
+
+
 class Monitor:
     def __init__(self):
         self.status = None
@@ -258,6 +640,9 @@ class Monitor:
                     and state.get("notifications", True)):
                 self.report_day = now.date()
                 bioauth_information(detail)
+                threading.Thread(target=notify_if_update_available, daemon=True).start()
+        elif status == "down" and (node_stopped_on_purpose or node_lock.locked()):
+            pass  # stopped from Telegram or a node operation is running
         elif status != self.status or time.monotonic() - self.last_alert >= ALERT_REPEAT_MINUTES * 60:
             send(detail)
             self.last_alert = time.monotonic()
@@ -318,6 +703,16 @@ def handle_command(chat_id, text):
         threading.Thread(target=lambda: send(new_auth_url()), daemon=True).start()
     elif command == "/status":
         threading.Thread(target=send_status, daemon=True).start()
+    elif command in NODE_COMMANDS:
+        description, operation = NODE_COMMANDS[command]
+        if arg == "confirm":
+            run_node_operation(operation)
+        else:
+            send(f"This will {description}. To continue, send '{command} confirm'")
+    elif command == "/update_node":
+        run_node_operation(update_node(arg == "confirm"))
+    elif command == "/node_status":
+        run_node_operation(node_status)
     elif command in ("/help", "/start"):  # Telegram sends /start when the bot is first opened
         send(HELP)
     else:
@@ -378,5 +773,7 @@ def main():
 if __name__ == "__main__":
     if DETECT_RPC:
         print(detect_rpc_url() or "")
+    elif ENGINE_PROBE:
+        engine_probe()
     else:
         main()
