@@ -18,6 +18,7 @@ import queue
 import re
 import secrets
 import shutil
+import signal
 import socket
 import struct
 import subprocess
@@ -493,17 +494,54 @@ def update_available(engine):
     return bool(engine.call("checkForBinariesUpdates").get("updateAvailable"))
 
 
+def peer_pids():
+    """Pids of running humanode-peer nodes, not short commands like `humanode-peer bioauth auth-url`."""
+    if not os.path.isdir("/proc"):
+        return []
+    pids = []
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                args = f.read().split(b"\0")
+        except OSError:
+            continue
+        if os.path.basename(args[0]) == b"humanode-peer" and b"bioauth" not in args and b"key" not in args:
+            pids.append(int(pid))
+    return pids
+
+
+def wait_until(condition, timeout):
+    deadline = time.monotonic() + timeout
+    while not condition():
+        if time.monotonic() > deadline:
+            return False
+        time.sleep(1)
+    return True
+
+
 def stop_node(engine):
     global node_stopped_on_purpose
     send("Stopping the node...")
     node_stopped_on_purpose = True
     engine.call("stopWorkspace", timeout=300)
+    # the engine may not stop a node started by another engine (the Launcher's), or return before
+    # the node has exited and released its database lock
+    if not wait_until(lambda: not peer_pids(), 60):
+        log(f"The node is still running after stopWorkspace, sending SIGTERM to {peer_pids()}")
+        for pid in peer_pids():
+            os.kill(pid, signal.SIGTERM)  # graceful shutdown, like Ctrl+C
+        if not wait_until(lambda: not peer_pids(), 120):
+            raise EngineError(f"the node did not stop (pids {peer_pids()}), check it on the server")
     send("Node stopped")
 
 
 def start_node(engine):
     global node_stopped_on_purpose
     node_stopped_on_purpose = False
+    if peer_pids():  # a second node would fail on the database lock
+        raise EngineError(f"the node is already running (pids {peer_pids()}), use /restart_node")
     cfg = engine.call("readWorkspaceConfig").get("cfg") or {}
     if cfg.get("isValidator") and not cfg.get("mnemonicInserted"):  # the Launcher refuses to start too
         raise EngineError("the mnemonic is not inserted, insert it from the Launcher settings first")
@@ -695,7 +733,7 @@ def engine_probe():
         cfg = engine.call("readWorkspaceConfig").get("cfg") or {}
         print("config keys:", sorted(cfg))
         print("isValidator:", cfg.get("isValidator"), " mnemonicInserted:", cfg.get("mnemonicInserted"))
-        print("node running:", node_is_running(engine))
+        print("node running:", node_is_running(engine), " humanode-peer pids:", peer_pids())
         print("checkForBinariesUpdates:", engine.call("checkForBinariesUpdates"))
     print("engine still running after disconnect:", engine.process.poll() is None)
 
