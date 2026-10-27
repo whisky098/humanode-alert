@@ -11,6 +11,7 @@ To check the node controls without changing anything (run as the node user):
 """
 
 import base64
+import html
 import itertools
 import json
 import os
@@ -82,24 +83,40 @@ DAILY_REPORT_HOUR = 12
 # systemd sets STATE_DIRECTORY (/var/lib/humanode-alert); otherwise use the current directory
 STATE_FILE = os.path.join(os.environ.get("STATE_DIRECTORY", "."), "state.json")
 
-SUCCESSFULLY_REGISTERED_MESSAGE = f"You have successfully registered, you will receive alerts every day (if have enabled notifications) with time left to authenticate and reminders {', '.join(map(str, sorted(WARN_MINUTES, reverse=True)))} minutes before expiry. To see commands for enable/disable notification type /help"
-UNKNOWN_COMMAND = "Unknown command, to register for receive alert about your node send command '/register code', to set time zone id send command '/timezone time_zone_id'"
-MISSING_CHAT_ID = "Chat id not found, need to register, to register type '/register code' in chat with bot, the code is REGISTER_CODE in config.env"
-WRONG_REGISTER_CODE = "Wrong or missing code, send '/register code', the code is REGISTER_CODE in config.env"
-SUCCESSFULLY_REGISTERED_TIME_ZONE_ID = "You have successfully set time zone id"
-ENABLE_NOTIF = "Notifications have been enabled"
-DISABLED_NOTIF = "Notifications have been disabled"
-CANT_GET_URL = "Can't get url for authentication, check logs and HUMANODE_WORKSPACE in config.env"
-HELP = """/register code -> register your node in this chat, the code is REGISTER_CODE in config.env
-/timezone -> set timezone, example '/timezone Europe/Chisinau' or '/timezone UTC+3' (default UTC)
-/enable_notification -> enable notification about node every day at noon
-/disable_notification -> disable notification about node every day at noon
-/get_bioauth_link -> get new auth link
-/status -> time left until the next BioAuth
-/node_status -> whether the node process runs and if a node update is available
-/stop_node, /start_node, /restart_node -> control the node, asks for confirmation
-/update_node -> install a node update, asks for confirmation
-/menu, /help -> list of commands, pins the menu buttons under the message field"""
+# Telegram messages use HTML formatting: escape any value that is not ours with html.escape
+SUCCESSFULLY_REGISTERED_MESSAGE = f"""✅ <b>Registered</b>
+
+You will receive:
+• ⏰ reminders {', '.join(map(str, sorted(WARN_MINUTES, reverse=True)))} minutes before BioAuth expires
+• 🚨 alerts when BioAuth has expired or the node is down
+• ☀️ a daily report at {DAILY_REPORT_HOUR}:00, if enabled
+
+Use the buttons below, or /help for all commands."""
+UNKNOWN_COMMAND = "🤔 Unknown command. Send /help to see all commands."
+MISSING_CHAT_ID = "Chat id not found, register with '/register code', the code is REGISTER_CODE in config.env"
+NOT_REGISTERED = "🔒 <b>This bot is not registered yet</b>\n\nSend <code>/register code</code>, the code is <code>REGISTER_CODE</code> in config.env."
+WRONG_REGISTER_CODE = "⛔ <b>Wrong or missing code</b>\n\nSend <code>/register code</code>, the code is <code>REGISTER_CODE</code> in config.env."
+SUCCESSFULLY_REGISTERED_TIME_ZONE_ID = "🕒 Timezone set to <b>{}</b>"
+ENABLE_NOTIF = f"🔔 Daily report <b>enabled</b>, every day at {DAILY_REPORT_HOUR}:00"
+DISABLED_NOTIF = "🔕 Daily report <b>disabled</b>"
+CANT_GET_URL = "❌ <b>Can't get the authentication link</b>\n\nCheck the logs and HUMANODE_WORKSPACE in config.env."
+HELP = f"""📖 <b>Commands</b>
+
+<b>BioAuth</b>
+/status – time left until the next BioAuth
+/get_bioauth_link – new authentication link
+
+<b>Node</b>
+/node_status – node process and available updates
+/restart_node, /stop_node, /start_node – control the node
+/update_node – install a node update
+
+<b>Settings</b>
+/timezone – e.g. <code>/timezone Europe/Chisinau</code> or <code>/timezone UTC+3</code>
+/enable_notification, /disable_notification – daily report at {DAILY_REPORT_HOUR}:00
+/register – <code>/register code</code>, the code is in config.env
+
+The buttons below run the same commands."""
 # shown in the Telegram command menu next to the message field
 BOT_COMMANDS = [
     ("menu", "Buttons for the commands"),
@@ -190,14 +207,31 @@ def telegram(method, params, timeout=15):
     return post_json(f"https://api.telegram.org/bot{TOKEN}/{method}", params, timeout)["result"]
 
 
+def plain(text):
+    """The text of an HTML message without the formatting, for the logs."""
+    return html.unescape(re.sub(r"<[^>]+>", "", text))
+
+
+def send_html(method, params):
+    """Calls a Telegram method with an HTML text. If Telegram rejects the formatting, sends plain text instead,
+    so an alert is never lost."""
+    try:
+        return telegram(method, {**params, "parse_mode": "HTML"})
+    except urllib.error.HTTPError as e:
+        if e.code != 400:
+            raise
+        log(f"Telegram rejected the formatting ({e}), sending plain text")
+        return telegram(method, {**params, "text": plain(params["text"])})
+
+
 def send(text, chat_id=None):
     chat_id = chat_id or state.get("chat_id")
     if chat_id is None:
-        log(f"{MISSING_CHAT_ID}. Message: {text}")
+        log(f"{MISSING_CHAT_ID}. Message: {plain(text)}")
         return
-    log(f"Sending: {text}")
+    log(f"Sending: {plain(text)}")
     try:
-        telegram("sendMessage", {"chat_id": chat_id, "text": text})
+        send_html("sendMessage", {"chat_id": chat_id, "text": text})
     except Exception as e:
         log(f"Failed to send message: {e}")
 
@@ -245,24 +279,27 @@ def bioauth_status():
         response = bioauth_rpc(RPC_URL)
     except Exception as e:
         log(f"Humanode is down: {e}")
-        return "down", "Humanode is down"
+        return "down", "🔴 <b>Humanode is down</b>\n\nThe node does not respond."
 
     result = response.get("result")
     if isinstance(result, str):
-        return "expired", "BioAuth has expired. Send /get_bioauth_link to get the authentication link"
+        return "expired", ("❌ <b>BioAuth has expired</b>\n\nPress 🔗 BioAuth link or send /get_bioauth_link "
+                           "to authenticate again.")
     try:
         return "active", datetime.fromtimestamp(result["Active"]["expires_at"] / 1000, tz())
     except (KeyError, TypeError):
         log(f"Unexpected response: {response}")
-        return "invalid", "Can't get expire time"
+        return "invalid", "⚠️ <b>Can't get the BioAuth expiry time</b>\n\nCheck the node logs."
 
 
-def bioauth_information(expires_at):
+def bioauth_information(expires_at, title="🟢 <b>BioAuth active</b>"):
     seconds = max(int((expires_at - datetime.now(tz())).total_seconds()), 0)
     days, seconds = divmod(seconds, 24 * 3600)
     hours, seconds = divmod(seconds, 3600)
-    minutes, seconds = divmod(seconds, 60)
-    send(f"Next BioAuth on {expires_at:%Y-%m-%d %H:%M:%S}, remaining {days}d and {hours}h:{minutes}m:{seconds}s")
+    minutes = seconds // 60
+    remaining = f"{days}d {hours}h {minutes}m" if days else f"{hours}h {minutes}m" if hours else f"{minutes}m"
+    send(f"{title}\n\n📅 Next BioAuth: <b>{expires_at:%Y-%m-%d %H:%M}</b> {html.escape(expires_at.tzname() or '')}\n"
+         f"⏳ Remaining: <b>{remaining}</b>")
 
 
 class WebSocket:
@@ -523,7 +560,7 @@ def wait_until(condition, timeout):
 
 def stop_node(engine):
     global node_stopped_on_purpose
-    send("Stopping the node...")
+    send("⏹ Stopping the node...")
     node_stopped_on_purpose = True
     engine.call("stopWorkspace", timeout=300)
     # the engine may not stop a node started by another engine (the Launcher's), or return before
@@ -534,7 +571,7 @@ def stop_node(engine):
             os.kill(pid, signal.SIGTERM)  # graceful shutdown, like Ctrl+C
         if not wait_until(lambda: not peer_pids(), 120):
             raise EngineError(f"the node did not stop (pids {peer_pids()}), check it on the server")
-    send("Node stopped")
+    send("✅ Node stopped")
 
 
 def start_node(engine):
@@ -545,7 +582,7 @@ def start_node(engine):
     cfg = engine.call("readWorkspaceConfig").get("cfg") or {}
     if cfg.get("isValidator") and not cfg.get("mnemonicInserted"):  # the Launcher refuses to start too
         raise EngineError("the mnemonic is not inserted, insert it from the Launcher settings first")
-    send("Starting the node...")
+    send("▶️ Starting the node...")
     engine.call("startWorkspace", timeout=300)
 
 
@@ -557,10 +594,10 @@ def install_update(engine):
         percent = int(progress * 100 if progress <= 1 else progress) // 25 * 25
         if 0 < percent < 100 and percent not in reported:
             reported.add(percent)
-            send(f"Update {percent}%")
+            send(f"📦 Update {percent}%")
 
     stop_node(engine)
-    send("Installing the update...")
+    send("📦 Installing the update...")
     try:
         engine.call("updateWorkspace", {"onProgress": on_progress,
                                         "onFinish": lambda *args: result.setdefault("finished", True),
@@ -571,21 +608,22 @@ def install_update(engine):
         start_node(engine)  # never leave the node stopped, even when the update failed
     if "error" in result:
         raise EngineError(f"the update failed: {result['error']}")
-    send("Update installed")
+    send("✅ Update installed")
 
 
 def report_node_started():
-    send("Node started, waiting for its RPC to respond...")
+    send("⏳ Node started, waiting for its RPC to respond...")
     deadline = time.monotonic() + 300
     while time.monotonic() < deadline:
         try:
             if "result" in bioauth_rpc(RPC_URL, timeout=5):
-                send_status()
+                send_status("✅ <b>Node is up</b>")
                 return
         except Exception:
             pass
         time.sleep(5)
-    send("The node was started, but its RPC does not respond after 5 minutes. Check it later with /status")
+    send("⚠️ <b>The node RPC does not respond</b>\n\nThe node was started, but its RPC does not respond after "
+         "5 minutes. Check it later with /status.")
 
 
 def run_node_operation(operation):
@@ -593,7 +631,7 @@ def run_node_operation(operation):
     def run():
         # a short wait covers a confirmation pressed while the previous engine is still closing
         if not node_lock.acquire(timeout=20):
-            send("Another node operation is running, try again later")
+            send("⏳ Another node operation is running, try again later.")
             return
         try:
             with Engine() as engine:
@@ -602,7 +640,7 @@ def run_node_operation(operation):
                 report_node_started()
         except Exception as e:
             log(f"Node operation failed: {e!r}")
-            send(f"Node operation failed: {e}")
+            send(f"❌ <b>Node operation failed</b>\n\n{html.escape(str(e))}")
         finally:
             node_lock.release()
 
@@ -616,15 +654,16 @@ confirmations = {}  # token: (operation, message_id, question) waiting for a Yes
 def ask_confirmation(question, operation):
     """Sends Yes/No buttons. The operation runs only if Yes is pressed within CONFIRM_SECONDS."""
     token = secrets.token_hex(4)
-    buttons = [[{"text": "Yes", "callback_data": f"yes:{token}"}, {"text": "No", "callback_data": f"no:{token}"}]]
+    buttons = [[{"text": "✅ Yes", "callback_data": f"yes:{token}"}, {"text": "❌ No", "callback_data": f"no:{token}"}]]
+    log(f"Asking: {plain(question)}")
     try:
-        message = telegram("sendMessage", {"chat_id": state["chat_id"], "reply_markup": {"inline_keyboard": buttons},
-                                           "text": f"{question}\nConfirm within {CONFIRM_SECONDS} seconds."})
+        message = send_html("sendMessage", {"chat_id": state["chat_id"], "reply_markup": {"inline_keyboard": buttons},
+                                            "text": f"{question}\n\n⏱ <i>Confirm within {CONFIRM_SECONDS} seconds</i>"})
     except Exception as e:
         log(f"Failed to send message: {e}")
         return
     confirmations[token] = (operation, message["message_id"], question)
-    timer = threading.Timer(CONFIRM_SECONDS, close_confirmation, args=(token, "Expired, nothing was done"))
+    timer = threading.Timer(CONFIRM_SECONDS, close_confirmation, args=(token, "⌛ <i>Expired, nothing was done</i>"))
     timer.daemon = True
     timer.start()
 
@@ -636,31 +675,33 @@ def close_confirmation(token, outcome):
         return None
     operation, message_id, question = pending
     try:
-        telegram("editMessageText", {"chat_id": state["chat_id"], "message_id": message_id,
-                                     "text": f"{question}\n{outcome}"})
+        send_html("editMessageText", {"chat_id": state["chat_id"], "message_id": message_id,
+                                      "text": f"{question}\n\n{outcome}"})
     except Exception as e:
         log(f"Failed to edit message: {e}")
     return operation
 
 
 MENU = [
-    [("Status", "/status"), ("Node status", "/node_status")],
-    [("BioAuth link", "/get_bioauth_link")],
-    [("Restart node", "/restart_node"), ("Stop node", "/stop_node"), ("Start node", "/start_node")],
-    [("Update node", "/update_node")],
-    [("Daily report on", "/enable_notification"), ("Daily report off", "/disable_notification")],
+    [("📊 Status", "/status"), ("🖥 Node status", "/node_status")],
+    [("🔗 BioAuth link", "/get_bioauth_link")],
+    [("🔄 Restart node", "/restart_node"), ("⏹ Stop node", "/stop_node"), ("▶️ Start node", "/start_node")],
+    [("⬆️ Update node", "/update_node")],
+    [("🔔 Daily report on", "/enable_notification"), ("🔕 Daily report off", "/disable_notification")],
 ]
 MENU_COMMANDS = {label: command for row in MENU for label, command in row}
+# labels without the emoji, as sent by menus pinned by an older version
+MENU_COMMANDS.update({label.split(" ", 1)[1]: command for label, command in list(MENU_COMMANDS.items())})
 
 
 def send_menu(text):
     """Pins the menu buttons under the message field. Pressing one sends its label, see MENU_COMMANDS."""
     keyboard = [[{"text": label} for label, _ in row] for row in MENU]
-    log(f"Sending menu: {text}")
+    log(f"Sending menu: {plain(text)}")
     try:
-        telegram("sendMessage", {"chat_id": state["chat_id"], "text": text,
-                                 "reply_markup": {"keyboard": keyboard, "is_persistent": True,
-                                                  "resize_keyboard": True}})
+        send_html("sendMessage", {"chat_id": state["chat_id"], "text": text,
+                                  "reply_markup": {"keyboard": keyboard, "is_persistent": True,
+                                                   "resize_keyboard": True}})
     except Exception as e:
         log(f"Failed to send message: {e}")
 
@@ -674,7 +715,7 @@ def handle_button(callback):
     elif kind == "cmd":  # button of an older inline menu, same as typing the command
         handle_command(chat_id, value)
     else:  # yes/no confirmation
-        operation = close_confirmation(value, "Confirmed" if kind == "yes" else "Cancelled")
+        operation = close_confirmation(value, "✅ <b>Confirmed</b>" if kind == "yes" else "❌ <b>Cancelled</b>")
         answer = ("Confirmed" if kind == "yes" else "Cancelled") if operation else "Expired"
         if operation and kind == "yes":
             run_node_operation(operation)
@@ -682,29 +723,31 @@ def handle_button(callback):
 
 
 NODE_COMMANDS = {
-    # command: (what it does, operation returning True when it started the node)
-    "/stop_node": ("stop your node. It stops validating until you send /start_node",
+    # command: (confirmation question, operation returning True when it started the node)
+    "/stop_node": ("⏹ <b>Stop the node?</b>\n\nIt stops validating until you start it again.",
                    lambda engine: stop_node(engine)),
-    "/start_node": ("start your node", lambda engine: start_node(engine) or True),
-    "/restart_node": ("restart your node", lambda engine: stop_node(engine) or start_node(engine) or True),
+    "/start_node": ("▶️ <b>Start the node?</b>", lambda engine: start_node(engine) or True),
+    "/restart_node": ("🔄 <b>Restart the node?</b>\n\nIt will be offline for a short time.",
+                      lambda engine: stop_node(engine) or start_node(engine) or True),
 }
 
 
 def node_status(engine):
     running = node_is_running(engine)
     update = update_available(engine)
-    send(f"Node process: {'running' if running else 'stopped'}\n"
-         f"Node update available: {'yes, send /update_node' if update else 'no'}")
+    send(f"🖥 <b>Node status</b>\n\n"
+         f"Process: {'🟢 running' if running else '🔴 stopped'}\n"
+         f"Update: {'⬆️ available, press ⬆️ Update node' if update else '✅ up to date'}")
 
 
 def update_node(confirmed):
     def operation(engine):
         if not update_available(engine):
-            send("No node updates available")
+            send("✅ Your node is up to date")
             return False
         if not confirmed:
-            ask_confirmation("A node update is available. Updating stops the node, installs the update and "
-                             "starts the node again. Continue?", update_node(True))
+            ask_confirmation("⬆️ <b>Node update available</b>\n\nUpdating stops the node, installs the update and "
+                             "starts the node again. Install now?", update_node(True))
             return False
         install_update(engine)
         return True
@@ -718,7 +761,7 @@ def notify_if_update_available():
     try:
         with Engine() as engine:
             if update_available(engine):
-                send("A new node version is available. Send /update_node to install it")
+                send("⬆️ <b>A new node version is available</b>\n\nPress ⬆️ Update node to install it.")
     except Exception as e:
         log(f"Update check failed: {e!r}")
     finally:
@@ -758,15 +801,16 @@ class Monitor:
             left = (detail - now).total_seconds() / 60
             reached = {m for m in WARN_MINUTES if left <= m}
             if self.status not in (None, "active"):
-                bioauth_information(detail)  # back to normal after an alert
+                bioauth_information(detail, "✅ <b>Back to normal</b>")  # after an alert
             elif reached - self.warned:
                 minutes = max(round(left), 0)
-                send(f"Your BioAuth will expire soon. You have {minutes} minute{'' if minutes == 1 else 's'} left")
+                send(f"⏰ <b>BioAuth expires in {minutes} minute{'' if minutes == 1 else 's'}</b>\n\n"
+                     "Authenticate soon, press 🔗 BioAuth link to get the link.")
 
             if (now.hour == DAILY_REPORT_HOUR and self.report_day != now.date()
                     and state.get("notifications", True)):
                 self.report_day = now.date()
-                bioauth_information(detail)
+                bioauth_information(detail, "☀️ <b>Daily report</b>")
                 threading.Thread(target=notify_if_update_available, daemon=True).start()
         elif status == "down" and (node_stopped_on_purpose or node_lock.locked()):
             pass  # stopped from Telegram or a node operation is running
@@ -778,12 +822,18 @@ class Monitor:
         self.warned = reached
 
 
-def send_status():
+def send_status(title="🟢 <b>BioAuth active</b>"):
     status, detail = bioauth_status()
     if status == "active":
-        bioauth_information(detail)
+        bioauth_information(detail, title)
     else:
         send(detail)
+
+
+def send_auth_link():
+    url = new_auth_url()
+    send(CANT_GET_URL if url == CANT_GET_URL else
+         f"🔗 <b>BioAuth link</b>\n\nOpen it on your phone to authenticate:\n{html.escape(url)}")
 
 
 def handle_command(chat_id, text):
@@ -798,7 +848,7 @@ def handle_command(chat_id, text):
             send(WRONG_REGISTER_CODE, chat_id)
             return
         if owner is not None and owner != chat_id:
-            send("This bot has been registered to another chat, you will no longer receive alerts here.", owner)
+            send("ℹ️ <b>This bot was registered to another chat</b>\n\nYou will no longer receive alerts here.", owner)
         state["chat_id"] = chat_id
         save_state()
         log(f"Registered chat {chat_id}")
@@ -807,18 +857,19 @@ def handle_command(chat_id, text):
 
     if chat_id != owner:
         if owner is None:
-            send(MISSING_CHAT_ID, chat_id)
+            send(NOT_REGISTERED, chat_id)
         return  # ignore everyone except the owner
 
     if command == "/timezone":
         try:
             parse_timezone(arg)
         except Exception:
-            send("Invalid timezone, example: '/timezone Europe/Chisinau'")
+            send("⚠️ <b>Invalid timezone</b>\n\nExamples: <code>/timezone Europe/Chisinau</code>, "
+                 "<code>/timezone UTC+3</code>")
             return
         state["timezone"] = arg
         save_state()
-        send(SUCCESSFULLY_REGISTERED_TIME_ZONE_ID)
+        send(SUCCESSFULLY_REGISTERED_TIME_ZONE_ID.format(html.escape(arg)))
     elif command == "/enable_notification":
         state["notifications"] = True
         save_state()
@@ -828,15 +879,16 @@ def handle_command(chat_id, text):
         save_state()
         send(DISABLED_NOTIF)
     elif command == "/get_bioauth_link":
-        threading.Thread(target=lambda: send(new_auth_url()), daemon=True).start()
+        send("🔗 Generating a new BioAuth link...")
+        threading.Thread(target=send_auth_link, daemon=True).start()
     elif command == "/status":
         threading.Thread(target=send_status, daemon=True).start()
     elif command in NODE_COMMANDS:
-        description, operation = NODE_COMMANDS[command]
+        question, operation = NODE_COMMANDS[command]
         if arg == "confirm":
             run_node_operation(operation)
         else:
-            ask_confirmation(f"This will {description}. Continue?", operation)
+            ask_confirmation(question, operation)
     elif command == "/update_node":
         run_node_operation(update_node(arg == "confirm"))
     elif command == "/node_status":
@@ -882,8 +934,9 @@ def check_rpc_url():
     if url is None:
         log(f"Humanode RPC does not respond at {RPC_URL}, is the node running?")
     elif url != RPC_URL:
-        send(f"Humanode RPC does not respond at {RPC_URL}, using {url} instead. "
-             f"Set RPC_URL={url} in {CONFIG_FILE}")
+        send(f"⚠️ <b>Node RPC address changed</b>\n\nNo answer at {html.escape(RPC_URL)}, using "
+             f"{html.escape(url)} instead. Set <code>RPC_URL={html.escape(url)}</code> in "
+             f"{html.escape(CONFIG_FILE)}.")
         RPC_URL = url
     else:
         log(f"Humanode RPC responds at {RPC_URL}")
