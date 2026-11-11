@@ -107,6 +107,7 @@ HELP = f"""📖 <b>Commands</b>
 /get_bioauth_link – new authentication link
 
 <b>Node</b>
+/panel – live panel, pinned and updated every minute
 /node_status – node process and available updates
 /restart_node, /stop_node, /start_node – control the node
 /update_node – install a node update
@@ -120,6 +121,7 @@ The buttons below run the same commands."""
 # shown in the Telegram command menu next to the message field
 BOT_COMMANDS = [
     ("menu", "Buttons for the commands"),
+    ("panel", "Live node panel, updated every minute"),
     ("status", "Time left until the next BioAuth"),
     ("get_bioauth_link", "Get a new authentication link"),
     ("node_status", "Node process and available updates"),
@@ -143,10 +145,14 @@ def load_state():
         return {}
 
 
+state_lock = threading.Lock()  # the panel and the node operations save from their own threads
+
+
 def save_state():
-    with open(STATE_FILE + ".tmp", "w") as f:
-        json.dump(state, f, indent=2)
-    os.replace(STATE_FILE + ".tmp", STATE_FILE)
+    with state_lock:
+        with open(STATE_FILE + ".tmp", "w") as f:
+            json.dump(dict(state), f, indent=2)  # a copy, other threads may add keys meanwhile
+        os.replace(STATE_FILE + ".tmp", STATE_FILE)
 
 
 state = load_state()
@@ -207,6 +213,14 @@ def telegram(method, params, timeout=15):
     return post_json(f"https://api.telegram.org/bot{TOKEN}/{method}", params, timeout)["result"]
 
 
+def telegram_error(error):
+    """The reason Telegram gives for a rejected call, e.g. 'Bad Request: message to edit not found'."""
+    try:
+        return json.loads(error.read()).get("description") or str(error)
+    except Exception:
+        return str(error)
+
+
 def plain(text):
     """The text of an HTML message without the formatting, for the logs."""
     return html.unescape(re.sub(r"<[^>]+>", "", text))
@@ -238,6 +252,14 @@ def send(text, chat_id=None):
 
 def bioauth_rpc(url, timeout=10):
     return post_json(url, {"jsonrpc": "2.0", "id": 1, "method": "bioauth_status", "params": []}, timeout)
+
+
+def rpc(method, *params, timeout=10):
+    """Calls a JSON-RPC method of the local node and returns its result."""
+    response = post_json(RPC_URL, {"jsonrpc": "2.0", "id": 1, "method": method, "params": list(params)}, timeout)
+    if "error" in response:
+        raise RuntimeError(f"{method} failed: {response['error']}")
+    return response.get("result")
 
 
 def detect_rpc_url():
@@ -292,14 +314,19 @@ def bioauth_status():
         return "invalid", "⚠️ <b>Can't get the BioAuth expiry time</b>\n\nCheck the node logs."
 
 
-def bioauth_information(expires_at, title="🟢 <b>BioAuth active</b>"):
+def bioauth_lines(expires_at):
+    """The next BioAuth and the time left, for messages and the panel."""
     seconds = max(int((expires_at - datetime.now(tz())).total_seconds()), 0)
     days, seconds = divmod(seconds, 24 * 3600)
     hours, seconds = divmod(seconds, 3600)
     minutes = seconds // 60
     remaining = f"{days}d {hours}h {minutes}m" if days else f"{hours}h {minutes}m" if hours else f"{minutes}m"
-    send(f"{title}\n\n📅 Next BioAuth: <b>{expires_at:%Y-%m-%d %H:%M}</b> {html.escape(expires_at.tzname() or '')}\n"
-         f"⏳ Remaining: <b>{remaining}</b>")
+    return (f"📅 Next BioAuth: <b>{expires_at:%Y-%m-%d %H:%M}</b> {html.escape(expires_at.tzname() or '')}\n"
+            f"⏳ Remaining: <b>{remaining}</b>")
+
+
+def bioauth_information(expires_at, title="🟢 <b>BioAuth active</b>"):
+    send(f"{title}\n\n{bioauth_lines(expires_at)}")
 
 
 class WebSocket:
@@ -518,6 +545,15 @@ class Engine:
 
 node_lock = threading.Lock()  # one node operation at a time
 node_stopped_on_purpose = False  # no "Humanode is down" alerts after /stop_node
+node_progress = None  # the current step of the running node operation, shown on the panel
+
+
+def progress(text):
+    """Reports a step of a node operation in the chat and on the panel."""
+    global node_progress
+    node_progress = text
+    send(text)
+    update_panel_soon()
 
 
 def node_is_running(engine):
@@ -528,7 +564,10 @@ def node_is_running(engine):
 
 
 def update_available(engine):
-    return bool(engine.call("checkForBinariesUpdates").get("updateAvailable"))
+    available = bool(engine.call("checkForBinariesUpdates").get("updateAvailable"))
+    state["update"] = {"available": available, "checked": time.time()}  # shown on the panel
+    save_state()
+    return available
 
 
 def peer_pids():
@@ -560,7 +599,7 @@ def wait_until(condition, timeout):
 
 def stop_node(engine):
     global node_stopped_on_purpose
-    send("⏹ Stopping the node...")
+    progress("⏹ Stopping the node...")
     node_stopped_on_purpose = True
     engine.call("stopWorkspace", timeout=300)
     # the engine may not stop a node started by another engine (the Launcher's), or return before
@@ -571,7 +610,7 @@ def stop_node(engine):
             os.kill(pid, signal.SIGTERM)  # graceful shutdown, like Ctrl+C
         if not wait_until(lambda: not peer_pids(), 120):
             raise EngineError(f"the node did not stop (pids {peer_pids()}), check it on the server")
-    send("✅ Node stopped")
+    progress("✅ Node stopped")
 
 
 def start_node(engine):
@@ -582,7 +621,7 @@ def start_node(engine):
     cfg = engine.call("readWorkspaceConfig").get("cfg") or {}
     if cfg.get("isValidator") and not cfg.get("mnemonicInserted"):  # the Launcher refuses to start too
         raise EngineError("the mnemonic is not inserted, insert it from the Launcher settings first")
-    send("▶️ Starting the node...")
+    progress("▶️ Starting the node...")
     engine.call("startWorkspace", timeout=300)
 
 
@@ -590,14 +629,14 @@ def install_update(engine):
     result, reported = {}, set()
 
     def on_progress(event):
-        progress = float((event or {}).get("progress") or 0)
-        percent = int(progress * 100 if progress <= 1 else progress) // 25 * 25
+        done = float((event or {}).get("progress") or 0)
+        percent = int(done * 100 if done <= 1 else done) // 25 * 25
         if 0 < percent < 100 and percent not in reported:
             reported.add(percent)
-            send(f"📦 Update {percent}%")
+            progress(f"📦 Update {percent}%")
 
     stop_node(engine)
-    send("📦 Installing the update...")
+    progress("📦 Installing the update...")
     try:
         engine.call("updateWorkspace", {"onProgress": on_progress,
                                         "onFinish": lambda *args: result.setdefault("finished", True),
@@ -608,11 +647,13 @@ def install_update(engine):
         start_node(engine)  # never leave the node stopped, even when the update failed
     if "error" in result:
         raise EngineError(f"the update failed: {result['error']}")
-    send("✅ Update installed")
+    state["update"] = {"available": False, "checked": time.time()}
+    save_state()
+    progress("✅ Update installed")
 
 
 def report_node_started():
-    send("⏳ Node started, waiting for its RPC to respond...")
+    progress("⏳ Node started, waiting for its RPC to respond...")
     deadline = time.monotonic() + 300
     while time.monotonic() < deadline:
         try:
@@ -629,6 +670,7 @@ def report_node_started():
 def run_node_operation(operation):
     """Runs operation(engine) in the background, one at a time, and reports errors in Telegram."""
     def run():
+        global node_progress
         # a short wait covers a confirmation pressed while the previous engine is still closing
         if not node_lock.acquire(timeout=20):
             send("⏳ Another node operation is running, try again later.")
@@ -642,7 +684,9 @@ def run_node_operation(operation):
             log(f"Node operation failed: {e!r}")
             send(f"❌ <b>Node operation failed</b>\n\n{html.escape(str(e))}")
         finally:
+            node_progress = None
             node_lock.release()
+            update_panel_soon()
 
     threading.Thread(target=run, daemon=True).start()
 
@@ -684,7 +728,7 @@ def close_confirmation(token, outcome):
 
 MENU = [
     [("📊 Status", "/status"), ("🖥 Node status", "/node_status")],
-    [("🔗 BioAuth link", "/get_bioauth_link")],
+    [("🔗 BioAuth link", "/get_bioauth_link"), ("📌 Live panel", "/panel")],
     [("🔄 Restart node", "/restart_node"), ("⏹ Stop node", "/stop_node"), ("▶️ Start node", "/start_node")],
     [("⬆️ Update node", "/update_node")],
     [("🔔 Daily report on", "/enable_notification"), ("🔕 Daily report off", "/disable_notification")],
@@ -712,8 +756,11 @@ def handle_button(callback):
     answer = ""
     if chat_id != state.get("chat_id"):
         answer = "Not allowed"
-    elif kind == "cmd":  # button of an older inline menu, same as typing the command
+    elif kind == "cmd":  # panel button, same as typing the command
         handle_command(chat_id, value)
+    elif kind == "refresh":  # 🔃 Refresh on the panel
+        update_panel_soon()
+        answer = "Refreshing"
     else:  # yes/no confirmation
         operation = close_confirmation(value, "✅ <b>Confirmed</b>" if kind == "yes" else "❌ <b>Cancelled</b>")
         answer = ("Confirmed" if kind == "yes" else "Cancelled") if operation else "Expired"
@@ -754,18 +801,19 @@ def update_node(confirmed):
     return operation
 
 
-def notify_if_update_available():
-    """Daily check, only notifies: updates are installed with /update_node."""
+def check_for_update(notify=True):
+    """Daily check, only notifies: updates are installed with /update_node. The panel shows the result."""
     if not os.path.exists(ENGINE) or not node_lock.acquire(blocking=False):
         return
     try:
         with Engine() as engine:
-            if update_available(engine):
+            if update_available(engine) and notify:
                 send("⬆️ <b>A new node version is available</b>\n\nPress ⬆️ Update node to install it.")
     except Exception as e:
         log(f"Update check failed: {e!r}")
     finally:
         node_lock.release()
+    update_panel_soon()
 
 
 def engine_probe():
@@ -782,6 +830,153 @@ def engine_probe():
         print("node running:", node_is_running(engine), " humanode-peer pids:", peer_pids())
         print("checkForBinariesUpdates:", engine.call("checkForBinariesUpdates"))
     print("engine still running after disconnect:", engine.process.poll() is None)
+
+
+# The live panel is a message pinned in the chat that the bot edits every minute, through the Telegram Bot API
+# only: nothing on the server is reachable from outside.
+PANEL_BUTTONS = [
+    [("🔄 Restart", "cmd:/restart_node"), ("⏹ Stop", "cmd:/stop_node"), ("▶️ Start", "cmd:/start_node")],
+    [("⬆️ Update", "cmd:/update_node"), ("🔗 BioAuth link", "cmd:/get_bioauth_link")],
+    [("🔃 Refresh", "refresh:")],
+]
+PANEL_KEYBOARD = {"inline_keyboard": [[{"text": text, "callback_data": data} for text, data in row]
+                                      for row in PANEL_BUTTONS]}
+PANEL_BIOAUTH_PROBLEMS = {
+    "expired": "❌ <b>BioAuth has expired</b>\nPress 🔗 BioAuth link to authenticate again.",
+    "down": "🔴 <b>The node does not respond</b>",
+    "invalid": "⚠️ <b>Can't get the BioAuth expiry time</b>",
+}
+panel_lock = threading.Lock()  # one edit at a time, from the minute loop, the buttons and the node operations
+
+
+def node_details():
+    """Peers, sync state and block numbers from the node RPC, as panel lines."""
+    try:
+        health = rpc("system_health", timeout=5)
+        best = int(rpc("chain_getHeader", timeout=5)["number"], 16)
+        finalized = int(rpc("chain_getHeader", rpc("chain_getFinalizedHead", timeout=5), timeout=5)["number"], 16)
+    except Exception as e:
+        log(f"Can't read the node details: {e!r}")
+        return ["⚠️ Can't read the peers and blocks"]
+    sync = "✅ synced"
+    if health.get("isSyncing"):
+        sync = "⏳ syncing"
+        try:
+            behind = (rpc("system_syncState", timeout=5).get("highestBlock") or 0) - best
+            if behind > 0:
+                sync += f", {behind:,} blocks behind"
+        except Exception:
+            pass
+    peers = health.get("peers", 0)
+    return [f"🔗 Peers: {'' if peers else '⚠️ '}<b>{peers}</b> · {sync}",
+            f"📦 Block <b>#{best:,}</b> · final #{finalized:,}"]
+
+
+def process_status(rpc_responds):
+    if rpc_responds:
+        return "🟢 running"
+    if peer_pids():
+        return "🟡 running, its RPC does not respond yet"
+    return "⏹ stopped from Telegram" if node_stopped_on_purpose else "🔴 not running"
+
+
+def update_status():
+    update = state.get("update")
+    if not update:
+        return "⬆️ Update: ❔ not checked yet, press ⬆️ Update"
+    if update["available"]:
+        return "⬆️ Update: <b>available</b>, press ⬆️ Update"
+    checked = datetime.fromtimestamp(update["checked"], tz())
+    when = f"{checked:%H:%M}" if checked.date() == datetime.now(tz()).date() else f"{checked:%Y-%m-%d %H:%M}"
+    return f"⬆️ Update: ✅ up to date <i>(checked {when})</i>"
+
+
+def panel_text():
+    lines = ["📌 <b>Humanode node · live</b>"]
+    if node_progress:
+        lines.append(f"⚙️ <i>{html.escape(plain(node_progress))}</i>")
+    status, detail = bioauth_status()
+    now = datetime.now(tz())
+    if status == "active":
+        soon = (detail - now).total_seconds() <= max(WARN_MINUTES, default=60) * 60
+        lines += ["", "⏰ <b>BioAuth expires soon</b>" if soon else "🟢 <b>BioAuth active</b>", bioauth_lines(detail)]
+    else:
+        lines += ["", PANEL_BIOAUTH_PROBLEMS[status]]
+    lines += ["", f"🖥 Process: {process_status(status != 'down')}"]
+    if status != "down":
+        lines += node_details()
+    lines.append(update_status())
+    lines += ["", f"🕒 <i>Updated {now:%H:%M:%S} {html.escape(now.tzname() or '')}</i>"]
+    return "\n".join(lines)
+
+
+def send_panel():
+    """Sends a new live panel, pins it and removes the previous one."""
+    chat_id = state["chat_id"]
+    with panel_lock:
+        old = state.get("panel_message_id")
+        try:
+            message = telegram("sendMessage", {"chat_id": chat_id, "text": panel_text(), "parse_mode": "HTML",
+                                               "reply_markup": PANEL_KEYBOARD})
+        except Exception as e:
+            log(f"Failed to send the panel: {e}")
+            return
+        log("Sent the live panel")
+        state["panel_message_id"] = message["message_id"]
+        save_state()
+        try:
+            telegram("pinChatMessage", {"chat_id": chat_id, "message_id": message["message_id"],
+                                        "disable_notification": True})
+        except Exception as e:
+            log(f"Failed to pin the panel: {e}")
+        if old is not None:
+            remove_panel(chat_id, old)
+    if not state.get("update"):
+        check_for_update(notify=False)
+
+
+def remove_panel(chat_id, message_id):
+    """Deletes an old panel. Telegram deletes only messages younger than 48 hours, older ones are unpinned and
+    lose their buttons."""
+    try:
+        telegram("deleteMessage", {"chat_id": chat_id, "message_id": message_id})
+        return
+    except Exception:
+        pass
+    for method, params in (("unpinChatMessage", {}),
+                           ("editMessageText", {"text": "📌 This panel was replaced by a newer one."})):
+        try:
+            telegram(method, {"chat_id": chat_id, "message_id": message_id, **params})
+        except Exception as e:
+            log(f"Failed to remove the old panel ({method}): {e}")
+
+
+def update_panel():
+    """Edits the live panel with the current status. Runs every minute, on 🔃 Refresh and during node operations."""
+    with panel_lock:
+        chat_id, message_id = state.get("chat_id"), state.get("panel_message_id")
+        if chat_id is None or message_id is None:
+            return
+        try:
+            telegram("editMessageText", {"chat_id": chat_id, "message_id": message_id, "text": panel_text(),
+                                         "parse_mode": "HTML", "reply_markup": PANEL_KEYBOARD})
+        except urllib.error.HTTPError as e:
+            error = telegram_error(e)
+            if "not modified" in error:  # pressed twice within the same second
+                return
+            log(f"Failed to update the panel: {error}")
+            if "not found" in error or "can't be edited" in error:
+                log("The panel was deleted, it is no longer updated. Send /panel for a new one.")
+                state.pop("panel_message_id", None)
+                save_state()
+        except Exception as e:
+            log(f"Failed to update the panel: {e}")
+
+
+def update_panel_soon():
+    """Updates the panel in the background, so a slow node RPC never holds up the caller."""
+    if state.get("panel_message_id") is not None:
+        threading.Thread(target=update_panel, daemon=True).start()
 
 
 class Monitor:
@@ -807,11 +1002,13 @@ class Monitor:
                 send(f"⏰ <b>BioAuth expires in {minutes} minute{'' if minutes == 1 else 's'}</b>\n\n"
                      "Authenticate soon, press 🔗 BioAuth link to get the link.")
 
+            notify = state.get("notifications", True)
             if (now.hour == DAILY_REPORT_HOUR and self.report_day != now.date()
-                    and state.get("notifications", True)):
+                    and (notify or "panel_message_id" in state)):  # the panel shows the last update check
                 self.report_day = now.date()
-                bioauth_information(detail, "☀️ <b>Daily report</b>")
-                threading.Thread(target=notify_if_update_available, daemon=True).start()
+                if notify:
+                    bioauth_information(detail, "☀️ <b>Daily report</b>")
+                threading.Thread(target=check_for_update, args=(notify,), daemon=True).start()
         elif status == "down" and (node_stopped_on_purpose or node_lock.locked()):
             pass  # stopped from Telegram or a node operation is running
         elif status != self.status or time.monotonic() - self.last_alert >= ALERT_REPEAT_MINUTES * 60:
@@ -849,6 +1046,7 @@ def handle_command(chat_id, text):
             return
         if owner is not None and owner != chat_id:
             send("ℹ️ <b>This bot was registered to another chat</b>\n\nYou will no longer receive alerts here.", owner)
+            state.pop("panel_message_id", None)  # message ids belong to the old chat
         state["chat_id"] = chat_id
         save_state()
         log(f"Registered chat {chat_id}")
@@ -893,6 +1091,8 @@ def handle_command(chat_id, text):
         run_node_operation(update_node(arg == "confirm"))
     elif command == "/node_status":
         run_node_operation(node_status)
+    elif command == "/panel":
+        threading.Thread(target=send_panel, daemon=True).start()
     elif command in ("/help", "/start", "/menu"):  # Telegram sends /start when the bot is first opened
         send_menu(HELP)
     else:
@@ -958,6 +1158,7 @@ def main():
             monitor.check()
         except Exception as e:
             log(f"Check failed: {e}")
+        update_panel()
         time.sleep(60 - time.time() % 60)  # start of every minute
 
 

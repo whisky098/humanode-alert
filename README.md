@@ -17,6 +17,8 @@ What it does:
   `127.0.0.1:9933` and tells you which one to put in the config
 - stops, starts, restarts and updates the node from Telegram, for nodes set up with the Humanode Launcher
   (experimental, see [Node control](#node-control-experimental))
+- keeps a live panel pinned in the chat, with the node status and the control buttons, updated every minute
+  (see [Live panel](#live-panel))
 - keeps a button menu pinned under the message field
 
 The authentication link is generated only when you send `/get_bioauth_link`, never automatically. Requesting
@@ -74,6 +76,7 @@ the bot was registered elsewhere.
 - `/disable_notification`: disable the daily report at 12:00
 - `/get_bioauth_link`: get a new authentication link
 - `/status`: time left until the next BioAuth
+- `/panel`: live panel with the node status and the control buttons, see [Live panel](#live-panel)
 - `/node_status`: whether the node process runs and if a node update is available
 - `/stop_node`, `/start_node`, `/restart_node`: control the node, see [Node control](#node-control-experimental)
 - `/update_node`: install a node update, see [Node control](#node-control-experimental)
@@ -81,6 +84,27 @@ the bot was registered elsewhere.
   need no text, and they stay there
 
 The commands are also listed in Telegram's menu button, next to the message field.
+
+## Live panel
+
+Send `/panel` or press 📌 Live panel to get a message with the node status and the control buttons. The bot pins
+it and updates it every minute, without notifications. It shows:
+
+- BioAuth: when the next authentication is due and the time left
+- whether the node process runs and its RPC responds
+- peers, sync state, and the best and finalized block
+- whether a node update is available, from the last check: every day at 12:00, or when you press ⬆️ Update
+- the current step of a node operation, for example `⏹ Stopping the node...`
+
+The buttons under the panel work like the commands. Restart, Stop, Start and Update still ask for confirmation,
+and 🔃 Refresh updates the panel right away. Alerts and reminders are still sent as separate messages, with a
+notification.
+
+`/panel` again replaces the panel with a new one at the bottom of the chat. To stop the updates, delete the
+panel message.
+
+The panel uses only the Telegram Bot API, like the rest of the bot. Nothing on the server is reachable from
+outside.
 
 ## Node control (experimental)
 
