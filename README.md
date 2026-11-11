@@ -19,7 +19,6 @@ What it does:
   (experimental, see [Node control](#node-control-experimental))
 - keeps a live panel pinned in the chat, with the node status and the control buttons, updated every minute
   (see [Live panel](#live-panel))
-- keeps a button menu pinned under the message field
 
 The authentication link is generated only when you send `/get_bioauth_link`, never automatically. Requesting
 links too often makes the node hang. The command runs `humanode-websocket-tunnel` (reused if it is already
@@ -53,9 +52,8 @@ At the end, the installer prints the command to send, with your registration cod
 /register 3f9c0a7d51e2b846
 ```
 
-Open your bot in Telegram and send it. From then on you receive the alerts in that chat, and the menu buttons
-appear under the message field. Messages from any other chat are ignored. The code makes sure that only you can
-claim the bot, because bot usernames are public.
+Open your bot in Telegram and send it. From then on you receive the alerts in that chat. Messages from any
+other chat are ignored. The code makes sure that only you can claim the bot, because bot usernames are public.
 
 The code is stored as `REGISTER_CODE` in the config. To see it again:
 
@@ -80,14 +78,14 @@ the bot was registered elsewhere.
 - `/node_status`: whether the node process runs and if a node update is available
 - `/stop_node`, `/start_node`, `/restart_node`: control the node, see [Node control](#node-control-experimental)
 - `/update_node`: install a node update, see [Node control](#node-control-experimental)
-- `/menu` or `/help`: list of commands. It also pins menu buttons under the message field, for the commands that
-  need no text, and they stay there
+- `/help`: list of commands
 
-The commands are also listed in Telegram's menu button, next to the message field.
+The commands are also listed in Telegram's menu button, next to the message field. The buttons for the node are
+on the [live panel](#live-panel).
 
 ## Live panel
 
-Send `/panel` or press 📌 Live panel to get a message with the node status and the control buttons. The bot pins
+Send `/panel` to get a message with the node status and the control buttons. The bot pins
 it and updates it every minute, without notifications. It shows:
 
 - BioAuth: when the next authentication is due and the time left

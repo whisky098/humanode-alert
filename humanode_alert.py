@@ -91,7 +91,7 @@ You will receive:
 • 🚨 alerts when BioAuth has expired or the node is down
 • ☀️ a daily report at {DAILY_REPORT_HOUR}:00, if enabled
 
-Use the buttons below, or /help for all commands."""
+Send /panel for the live panel with the node buttons, or /help for all commands."""
 UNKNOWN_COMMAND = "🤔 Unknown command. Send /help to see all commands."
 MISSING_CHAT_ID = "Chat id not found, register with '/register code', the code is REGISTER_CODE in config.env"
 NOT_REGISTERED = "🔒 <b>This bot is not registered yet</b>\n\nSend <code>/register code</code>, the code is <code>REGISTER_CODE</code> in config.env."
@@ -117,10 +117,9 @@ HELP = f"""📖 <b>Commands</b>
 /enable_notification, /disable_notification – daily report at {DAILY_REPORT_HOUR}:00
 /register – <code>/register code</code>, the code is in config.env
 
-The buttons below run the same commands."""
+The commands are also in the Telegram menu next to the message field."""
 # shown in the Telegram command menu next to the message field
 BOT_COMMANDS = [
-    ("menu", "Buttons for the commands"),
     ("panel", "Live node panel, updated every minute"),
     ("status", "Time left until the next BioAuth"),
     ("get_bioauth_link", "Get a new authentication link"),
@@ -305,8 +304,7 @@ def bioauth_status():
 
     result = response.get("result")
     if isinstance(result, str):
-        return "expired", ("❌ <b>BioAuth has expired</b>\n\nPress 🔗 BioAuth link or send /get_bioauth_link "
-                           "to authenticate again.")
+        return "expired", "❌ <b>BioAuth has expired</b>\n\nSend /get_bioauth_link to authenticate again."
     try:
         return "active", datetime.fromtimestamp(result["Active"]["expires_at"] / 1000, tz())
     except (KeyError, TypeError):
@@ -726,28 +724,24 @@ def close_confirmation(token, outcome):
     return operation
 
 
-MENU = [
-    [("📊 Status", "/status"), ("🖥 Node status", "/node_status")],
-    [("🔗 BioAuth link", "/get_bioauth_link"), ("📌 Live panel", "/panel")],
-    [("🔄 Restart node", "/restart_node"), ("⏹ Stop node", "/stop_node"), ("▶️ Start node", "/start_node")],
-    [("⬆️ Update node", "/update_node")],
-    [("🔔 Daily report on", "/enable_notification"), ("🔕 Daily report off", "/disable_notification")],
-]
-MENU_COMMANDS = {label: command for row in MENU for label, command in row}
-# labels without the emoji, as sent by menus pinned by an older version
-MENU_COMMANDS.update({label.split(" ", 1)[1]: command for label, command in list(MENU_COMMANDS.items())})
+KEYBOARD_REMOVED = ("ℹ️ <b>The buttons under the message field were removed</b>\n\n"
+                    "The commands are in the Telegram menu next to the message field. Send /panel for the live "
+                    "panel with the node buttons.")
 
 
-def send_menu(text):
-    """Pins the menu buttons under the message field. Pressing one sends its label, see MENU_COMMANDS."""
-    keyboard = [[{"text": label} for label, _ in row] for row in MENU]
-    log(f"Sending menu: {plain(text)}")
+def send_without_keyboard(text):
+    """Sends a message that also removes the buttons older versions pinned under the message field. Telegram
+    removes them only with a message."""
+    log(f"Sending: {plain(text)}")
     try:
         send_html("sendMessage", {"chat_id": state["chat_id"], "text": text,
-                                  "reply_markup": {"keyboard": keyboard, "is_persistent": True,
-                                                   "resize_keyboard": True}})
+                                  "reply_markup": {"remove_keyboard": True}})
     except Exception as e:
         log(f"Failed to send message: {e}")
+        return
+    if not state.get("keyboard_removed"):
+        state["keyboard_removed"] = True
+        save_state()
 
 
 def handle_button(callback):
@@ -784,7 +778,7 @@ def node_status(engine):
     update = update_available(engine)
     send(f"🖥 <b>Node status</b>\n\n"
          f"Process: {'🟢 running' if running else '🔴 stopped'}\n"
-         f"Update: {'⬆️ available, press ⬆️ Update node' if update else '✅ up to date'}")
+         f"Update: {'⬆️ available, send /update_node' if update else '✅ up to date'}")
 
 
 def update_node(confirmed):
@@ -808,7 +802,7 @@ def check_for_update(notify=True):
     try:
         with Engine() as engine:
             if update_available(engine) and notify:
-                send("⬆️ <b>A new node version is available</b>\n\nPress ⬆️ Update node to install it.")
+                send("⬆️ <b>A new node version is available</b>\n\nSend /update_node to install it.")
     except Exception as e:
         log(f"Update check failed: {e!r}")
     finally:
@@ -1000,7 +994,7 @@ class Monitor:
             elif reached - self.warned:
                 minutes = max(round(left), 0)
                 send(f"⏰ <b>BioAuth expires in {minutes} minute{'' if minutes == 1 else 's'}</b>\n\n"
-                     "Authenticate soon, press 🔗 BioAuth link to get the link.")
+                     "Authenticate soon, send /get_bioauth_link to get the link.")
 
             notify = state.get("notifications", True)
             if (now.hour == DAILY_REPORT_HOUR and self.report_day != now.date()
@@ -1035,7 +1029,6 @@ def send_auth_link():
 
 def handle_command(chat_id, text):
     owner = state.get("chat_id")
-    text = MENU_COMMANDS.get(text.strip(), text)  # a menu button sends its label
     command, _, arg = text.strip().partition(" ")
     command = command.split("@")[0]  # /help@my_bot in group chats
     arg = arg.strip()
@@ -1050,7 +1043,7 @@ def handle_command(chat_id, text):
         state["chat_id"] = chat_id
         save_state()
         log(f"Registered chat {chat_id}")
-        send_menu(SUCCESSFULLY_REGISTERED_MESSAGE)
+        send_without_keyboard(SUCCESSFULLY_REGISTERED_MESSAGE)
         return
 
     if chat_id != owner:
@@ -1094,7 +1087,7 @@ def handle_command(chat_id, text):
     elif command == "/panel":
         threading.Thread(target=send_panel, daemon=True).start()
     elif command in ("/help", "/start", "/menu"):  # Telegram sends /start when the bot is first opened
-        send_menu(HELP)
+        send_without_keyboard(HELP)
     else:
         send(UNKNOWN_COMMAND)
 
@@ -1150,6 +1143,8 @@ def main():
         telegram("setMyCommands", {"commands": [{"command": c, "description": d} for c, d in BOT_COMMANDS]})
     except Exception as e:
         log(f"Failed to set the command menu: {e}")
+    if state.get("chat_id") is not None and not state.get("keyboard_removed"):
+        send_without_keyboard(KEYBOARD_REMOVED)  # once, after an update from a version with the buttons
     threading.Thread(target=poll_commands, daemon=True).start()
 
     monitor = Monitor()
