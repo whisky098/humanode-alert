@@ -17,8 +17,8 @@ What it does:
   `127.0.0.1:9933` and tells you which one to put in the config
 - stops, starts, restarts and updates the node from Telegram, for nodes set up with the Humanode Launcher
   (experimental, see [Node control](#node-control-experimental))
-- keeps a live panel pinned in the chat, with the node status and the control buttons, updated every minute
-  (see [Live panel](#live-panel))
+- keeps a live panel in the chat, with the node status and the control buttons, updated every minute, and
+  deletes the other messages after 5 minutes (see [Live panel](#live-panel))
 
 The authentication link is generated only when you send `/get_bioauth_link`, never automatically. Requesting
 links too often makes the node hang. The command runs `humanode-websocket-tunnel` (reused if it is already
@@ -85,8 +85,8 @@ on the [live panel](#live-panel).
 
 ## Live panel
 
-Send `/panel` to get a message with the node status and the control buttons. The bot pins
-it and updates it every minute, without notifications. It shows:
+Send `/panel` to get a message with the node status and the control buttons. The bot updates it every minute,
+without notifications. It shows:
 
 - BioAuth: when the next authentication is due and the time left
 - whether the node process runs and its RPC responds
@@ -97,6 +97,13 @@ it and updates it every minute, without notifications. It shows:
 The buttons under the panel work like the commands. Restart, Stop, Start and Update still ask for confirmation,
 and 🔃 Refresh updates the panel right away. Alerts and reminders are still sent as separate messages, with a
 notification.
+
+So that the chat keeps only the panel, every other message is deleted after 5 minutes: your commands, the
+answers, the alerts and the reminders. The panel always shows the current state. To keep the messages longer,
+set `DELETE_AFTER_MINUTES` in the config, or `0` to keep them.
+
+Telegram lets bots delete messages only within 48 hours. To remove the older history, for example the messages
+from before this update, open the chat menu in Telegram, choose Clear history, then send `/panel`.
 
 `/panel` again replaces the panel with a new one at the bottom of the chat. To stop the updates, delete the
 panel message.

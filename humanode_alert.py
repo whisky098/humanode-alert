@@ -79,6 +79,8 @@ TUNNEL_CMD = [f"{WORKSPACE}/humanode-websocket-tunnel"]
 ENGINE = setting("HUMANODE_ENGINE", os.path.join(os.path.dirname(os.path.dirname(WORKSPACE)), "humanode-engine"))
 WARN_MINUTES = {int(m) for m in setting("WARN_MINUTES", "60,30,5,3,1").split(",") if m.strip()}
 ALERT_REPEAT_MINUTES = int(setting("ALERT_REPEAT_MINUTES", "5"))
+# messages, yours and the bot's, are deleted after this many minutes so the chat keeps only the panel; 0 keeps them
+DELETE_AFTER_MINUTES = int(setting("DELETE_AFTER_MINUTES", "5"))
 DAILY_REPORT_HOUR = 12
 # systemd sets STATE_DIRECTORY (/var/lib/humanode-alert); otherwise use the current directory
 STATE_FILE = os.path.join(os.environ.get("STATE_DIRECTORY", "."), "state.json")
@@ -107,7 +109,7 @@ HELP = f"""📖 <b>Commands</b>
 /get_bioauth_link – new authentication link
 
 <b>Node</b>
-/panel – live panel, pinned and updated every minute
+/panel – live panel, updated every minute
 /node_status – node process and available updates
 /restart_node, /stop_node, /start_node – control the node
 /update_node – install a node update
@@ -118,6 +120,8 @@ HELP = f"""📖 <b>Commands</b>
 /register – <code>/register code</code>, the code is in config.env
 
 The commands are also in the Telegram menu next to the message field."""
+if DELETE_AFTER_MINUTES:
+    HELP += f"\n\n🧹 Messages are deleted after {DELETE_AFTER_MINUTES} minutes, the panel stays."
 # shown in the Telegram command menu next to the message field
 BOT_COMMANDS = [
     ("panel", "Live node panel, updated every minute"),
@@ -244,9 +248,54 @@ def send(text, chat_id=None):
         return
     log(f"Sending: {plain(text)}")
     try:
-        send_html("sendMessage", {"chat_id": chat_id, "text": text})
+        message = send_html("sendMessage", {"chat_id": chat_id, "text": text})
     except Exception as e:
         log(f"Failed to send message: {e}")
+        return
+    delete_later(chat_id, message["message_id"])
+
+
+delete_lock = threading.Lock()
+DELETE_LIMIT_SECONDS = 48 * 3600  # Telegram lets bots delete messages only for 48 hours
+
+
+def delete_later(chat_id, message_id):
+    """Deletes a message after DELETE_AFTER_MINUTES, so the chat keeps only the panel. The list is kept in
+    state.json, so the messages are deleted even if the bot restarts meanwhile."""
+    if not DELETE_AFTER_MINUTES:
+        return
+    with delete_lock:
+        # a new list each time, save_state may be writing the old one from another thread
+        due = time.time() + DELETE_AFTER_MINUTES * 60
+        state["to_delete"] = state.get("to_delete", []) + [[chat_id, message_id, due]]
+    save_state()
+
+
+def delete_old_messages():
+    """Runs every minute and deletes the messages whose time has come."""
+    now = time.time()
+    with delete_lock:
+        queue = state.get("to_delete", [])
+        due = [m for m in queue if m[2] <= now]
+        if not due:
+            return
+        state["to_delete"] = [m for m in queue if m[2] > now]
+    retry = []
+    for chat_id in {m[0] for m in due}:
+        message_ids = [m[1] for m in due if m[0] == chat_id]
+        for i in range(0, len(message_ids), 100):  # at most 100 per call
+            try:  # messages already deleted by hand are skipped
+                telegram("deleteMessages", {"chat_id": chat_id, "message_ids": message_ids[i:i + 100]})
+            except urllib.error.HTTPError as e:
+                log(f"Failed to delete messages {message_ids[i:i + 100]}: {telegram_error(e)}")
+            except Exception as e:  # network error, try again next minute
+                log(f"Failed to delete messages: {e}")
+                retry += [m for m in due if m[0] == chat_id and m[1] in message_ids[i:i + 100]
+                          and now - m[2] < DELETE_LIMIT_SECONDS]
+    if retry:
+        with delete_lock:
+            state["to_delete"] = state.get("to_delete", []) + retry
+    save_state()
 
 
 def bioauth_rpc(url, timeout=10):
@@ -705,6 +754,7 @@ def ask_confirmation(question, operation):
         log(f"Failed to send message: {e}")
         return
     confirmations[token] = (operation, message["message_id"], question)
+    delete_later(state["chat_id"], message["message_id"])
     timer = threading.Timer(CONFIRM_SECONDS, close_confirmation, args=(token, "⌛ <i>Expired, nothing was done</i>"))
     timer.daemon = True
     timer.start()
@@ -734,11 +784,12 @@ def send_without_keyboard(text):
     removes them only with a message."""
     log(f"Sending: {plain(text)}")
     try:
-        send_html("sendMessage", {"chat_id": state["chat_id"], "text": text,
-                                  "reply_markup": {"remove_keyboard": True}})
+        message = send_html("sendMessage", {"chat_id": state["chat_id"], "text": text,
+                                            "reply_markup": {"remove_keyboard": True}})
     except Exception as e:
         log(f"Failed to send message: {e}")
         return
+    delete_later(state["chat_id"], message["message_id"])
     if not state.get("keyboard_removed"):
         state["keyboard_removed"] = True
         save_state()
@@ -826,8 +877,8 @@ def engine_probe():
     print("engine still running after disconnect:", engine.process.poll() is None)
 
 
-# The live panel is a message pinned in the chat that the bot edits every minute, through the Telegram Bot API
-# only: nothing on the server is reachable from outside.
+# The live panel is a message that the bot edits every minute and keeps when it deletes the others. It uses only
+# the Telegram Bot API: nothing on the server is reachable from outside.
 PANEL_BUTTONS = [
     [("🔄 Restart", "cmd:/restart_node"), ("⏹ Stop", "cmd:/stop_node"), ("▶️ Start", "cmd:/start_node")],
     [("⬆️ Update", "cmd:/update_node"), ("🔗 BioAuth link", "cmd:/get_bioauth_link")],
@@ -893,7 +944,8 @@ def panel_text():
     now = datetime.now(tz())
     if status == "active":
         soon = (detail - now).total_seconds() <= max(WARN_MINUTES, default=60) * 60
-        lines += ["", "⏰ <b>BioAuth expires soon</b>" if soon else "🟢 <b>BioAuth active</b>", bioauth_lines(detail)]
+        title = "⏰ <b>BioAuth expires soon</b>" if soon else "🟢 <b>BioAuth active</b>"
+        lines += ["", title, bioauth_lines(detail)]
     else:
         lines += ["", PANEL_BIOAUTH_PROBLEMS[status]]
     lines += ["", f"🖥 Process: {process_status(status != 'down')}"]
@@ -905,7 +957,7 @@ def panel_text():
 
 
 def send_panel():
-    """Sends a new live panel, pins it and removes the previous one."""
+    """Sends a new live panel and removes the previous one."""
     chat_id = state["chat_id"]
     with panel_lock:
         old = state.get("panel_message_id")
@@ -918,11 +970,6 @@ def send_panel():
         log("Sent the live panel")
         state["panel_message_id"] = message["message_id"]
         save_state()
-        try:
-            telegram("pinChatMessage", {"chat_id": chat_id, "message_id": message["message_id"],
-                                        "disable_notification": True})
-        except Exception as e:
-            log(f"Failed to pin the panel: {e}")
         if old is not None:
             remove_panel(chat_id, old)
     if not state.get("update"):
@@ -930,8 +977,8 @@ def send_panel():
 
 
 def remove_panel(chat_id, message_id):
-    """Deletes an old panel. Telegram deletes only messages younger than 48 hours, older ones are unpinned and
-    lose their buttons."""
+    """Deletes an old panel. Telegram deletes only messages younger than 48 hours, older ones are unpinned (older
+    versions pinned the panel) and lose their buttons."""
     try:
         telegram("deleteMessage", {"chat_id": chat_id, "message_id": message_id})
         return
@@ -1119,6 +1166,8 @@ def poll_commands():
                     handle_command(message["chat"]["id"], message["text"])
                 except Exception as e:
                     log(f"Command failed: {e}")
+            if message.get("chat", {}).get("id") == state.get("chat_id"):  # also after /register
+                delete_later(state["chat_id"], message["message_id"])
 
 
 def check_rpc_url():
@@ -1154,6 +1203,10 @@ def main():
         except Exception as e:
             log(f"Check failed: {e}")
         update_panel()
+        try:
+            delete_old_messages()
+        except Exception as e:
+            log(f"Deleting old messages failed: {e}")
         time.sleep(60 - time.time() % 60)  # start of every minute
 
 
