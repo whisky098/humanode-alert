@@ -17,7 +17,8 @@ What it does:
   `127.0.0.1:9933` and tells you which one to put in the config
 - stops, starts, restarts and updates the node from Telegram, for nodes set up with the Humanode Launcher
   (experimental, see [Node control](#node-control-experimental))
-- keeps a button menu pinned under the message field
+- keeps a live panel in the chat, with the node status and the control buttons, updated every minute, and
+  deletes the other messages after 5 minutes (see [Live panel](#live-panel))
 
 The authentication link is generated only when you send `/get_bioauth_link`, never automatically. Requesting
 links too often makes the node hang. The command runs `humanode-websocket-tunnel` (reused if it is already
@@ -51,9 +52,8 @@ At the end, the installer prints the command to send, with your registration cod
 /register 3f9c0a7d51e2b846
 ```
 
-Open your bot in Telegram and send it. From then on you receive the alerts in that chat, and the menu buttons
-appear under the message field. Messages from any other chat are ignored. The code makes sure that only you can
-claim the bot, because bot usernames are public.
+Open your bot in Telegram and send it. From then on you receive the alerts in that chat. Messages from any
+other chat are ignored. The code makes sure that only you can claim the bot, because bot usernames are public.
 
 The code is stored as `REGISTER_CODE` in the config. To see it again:
 
@@ -74,13 +74,42 @@ the bot was registered elsewhere.
 - `/disable_notification`: disable the daily report at 12:00
 - `/get_bioauth_link`: get a new authentication link
 - `/status`: time left until the next BioAuth
+- `/panel`: live panel with the node status and the control buttons, see [Live panel](#live-panel)
 - `/node_status`: whether the node process runs and if a node update is available
 - `/stop_node`, `/start_node`, `/restart_node`: control the node, see [Node control](#node-control-experimental)
 - `/update_node`: install a node update, see [Node control](#node-control-experimental)
-- `/menu` or `/help`: list of commands. It also pins menu buttons under the message field, for the commands that
-  need no text, and they stay there
+- `/help`: list of commands
 
-The commands are also listed in Telegram's menu button, next to the message field.
+The commands are also listed in Telegram's menu button, next to the message field. The buttons for the node are
+on the [live panel](#live-panel).
+
+## Live panel
+
+Send `/panel` to get a message with the node status and the control buttons. The bot updates it every minute,
+without notifications. It shows:
+
+- BioAuth: when the next authentication is due and the time left
+- whether the node process runs and its RPC responds
+- peers, sync state, and the best and finalized block
+- whether a node update is available, from the last check: every day at 12:00, or when you press ⬆️ Update
+- the current step of a node operation, for example `⏹ Stopping the node...`
+
+The buttons under the panel work like the commands. Restart, Stop, Start and Update still ask for confirmation,
+and 🔃 Refresh updates the panel right away. Alerts and reminders are still sent as separate messages, with a
+notification.
+
+So that the chat keeps only the panel, every other message is deleted after 5 minutes: your commands, the
+answers, the alerts and the reminders. The panel always shows the current state. To keep the messages longer,
+set `DELETE_AFTER_MINUTES` in the config, or `0` to keep them.
+
+Telegram lets bots delete messages only within 48 hours. To remove the older history, for example the messages
+from before this update, open the chat menu in Telegram, choose Clear history, then send `/panel`.
+
+`/panel` again replaces the panel with a new one at the bottom of the chat. To stop the updates, delete the
+panel message.
+
+The panel uses only the Telegram Bot API, like the rest of the bot. Nothing on the server is reachable from
+outside.
 
 ## Node control (experimental)
 
